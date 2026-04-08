@@ -65,14 +65,18 @@ class RosBagExtractor:
         self.original_dir = self.root_dir / "extract_ros2_bag" / "original"
         self.raw_data_dir = self.root_dir / "data" / "raw"
 
+    def get_msg_nanosecs(self, msg):
+        """统一从消息 Header 中提取纳秒级时间戳"""
+        return msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec
+
     def prepare_directory(self, target_path: Path):
         """检查并清理目录"""
         try:
             if target_path.exists():
                 shutil.rmtree(target_path)
             target_path.mkdir(parents=True, exist_ok=True)
-        except Exception as e:
-            pass # 抑制输出以防止破坏 rich 进度条渲染
+        except Exception:
+            pass
 
     def get_reader(self, path: Path):
         storage_options = rosbag2_py.StorageOptions(uri=str(path), storage_id='sqlite3')
@@ -85,6 +89,7 @@ class RosBagExtractor:
 
     def process_single_bag(self, folder_name, target_id, progress_queue, task_id):
         """处理单个 Bag 的核心逻辑"""
+        # 延迟导入以确保在子进程中环境正确
         from rm_interfaces.msg import ArmorsDebugMsg
         
         bag_path = self.original_dir / folder_name
@@ -101,13 +106,12 @@ class RosBagExtractor:
         photo_dir.mkdir(parents=True, exist_ok=True)
         label_dir.mkdir(parents=True, exist_ok=True)
 
-        # 更新 UI 状态
-        progress_queue.put({"task_id": task_id, "type": "description", "value": f"[cyan]读取标签中: {folder_name}"})
+        progress_queue.put({"task_id": task_id, "type": "description", "value": f"[cyan]建立索引: {folder_name}"})
         
         bridge = CvBridge()
 
         try:
-            # ================= 第一步：极速预读取所有标签信息 =================
+            # ================= 第一步：基于 Header 时间戳预读取标签 =================
             label_indices = []
             reader = self.get_reader(bag_path)
             
@@ -115,8 +119,12 @@ class RosBagExtractor:
             reader.set_filter(storage_filter)
             
             while reader.has_next():
-                (topic, data, t) = reader.read_next()
+                (_, data, _) = reader.read_next()
                 msg = deserialize_message(data, ArmorsDebugMsg)
+                
+                # 获取该消息对应的算法处理时间戳（与对应图像一致）
+                true_t = self.get_msg_nanosecs(msg)
+                
                 armor_list = []
                 for a in msg.armors_debug:
                     armor_list.append({
@@ -124,47 +132,51 @@ class RosBagExtractor:
                         'pts': [a.l_light_up_dx, a.l_light_up_dy, a.l_light_down_dx, a.l_light_down_dy,
                                 a.r_light_up_dx, a.r_light_up_dy, a.r_light_down_dx, a.r_light_down_dy]
                     })
-                label_indices.append((t, armor_list))
+                label_indices.append((true_t, armor_list))
 
             if not label_indices:
                 progress_queue.put({"task_id": task_id, "type": "description", "value": f"[yellow]无标签数据: {folder_name}"})
                 progress_queue.put({"task_id": task_id, "type": "done"})
                 return
 
+            # 按 Header 时间戳排序确保二分查找准确
             label_indices.sort(key=lambda x: x[0])
             label_timestamps = [x[0] for x in label_indices]
 
-            # 以提取到的标签总数为进度条总量
             expected_total = len(label_timestamps)
             progress_queue.put({"task_id": task_id, "type": "total", "value": expected_total})
-            progress_queue.put({"task_id": task_id, "type": "description", "value": f"[blue]匹配图像中: {folder_name}"})
+            progress_queue.put({"task_id": task_id, "type": "description", "value": f"[blue]同步保存中: {folder_name}"})
 
-            # ================= 第二步：流式读取图像并匹配保存 =================
+            # ================= 第二步：基于 Header 时间戳同步图像 =================
             reader = self.get_reader(bag_path)
-            
             image_filter = rosbag2_py.StorageFilter(topics=['/image_raw'])
             reader.set_filter(image_filter)
             
             img_count = 0
-            update_batch = 0  # 批量更新进度条以降低通信开销
+            update_batch = 0
             
             while reader.has_next():
-                (topic, data, t) = reader.read_next()
+                (_, data, _) = reader.read_next()
+                msg = deserialize_message(data, Image)
                 
-                idx = bisect.bisect_left(label_timestamps, t)
+                # 获取图像真实的物理曝光/发布时间戳
+                img_true_t = self.get_msg_nanosecs(msg)
+                
+                # 二分法寻找最接近的标签时间戳
+                idx = bisect.bisect_left(label_timestamps, img_true_t)
                 best_idx = idx
-                if idx > 0 and (idx == len(label_timestamps) or abs(t - label_timestamps[idx-1]) < abs(t - label_timestamps[idx])):
+                if idx > 0 and (idx == len(label_timestamps) or abs(img_true_t - label_timestamps[idx-1]) < abs(img_true_t - label_timestamps[idx])):
                     best_idx = idx - 1
 
-                if abs(t - label_timestamps[best_idx]) < 50_000_000:
-                    msg = deserialize_message(data, Image)
+                # 阈值判断：如果图像和最近的标签时间差超过 20ms，视为不匹配（针对 RM 100FPS+ 场景）
+                diff_ns = abs(img_true_t - label_timestamps[best_idx])
+                if diff_ns < 20_000_000:
                     cv_img = bridge.imgmsg_to_cv2(msg, "bgr8")
-
                     file_name = f"{img_count:06d}"
-                    cv2.imwrite(str(photo_dir / f"{file_name}.jpg"), cv_img)
                     
+                    # 导出图像与标签
+                    cv2.imwrite(str(photo_dir / f"{file_name}.jpg"), cv_img)
                     matched_armors = label_indices[best_idx][1]
-
                     with open(label_dir / f"{file_name}.txt", 'w') as f:
                         for a in matched_armors:
                             pts_str = " ".join(map(str, a['pts']))
@@ -173,32 +185,25 @@ class RosBagExtractor:
                     img_count += 1
                     update_batch += 1
                     
-                    # 每 10 帧更新一次 UI，防止进程间通信过载
                     if update_batch >= 10:
                         progress_queue.put({"task_id": task_id, "type": "advance", "value": update_batch})
                         update_batch = 0
-                    # 在 while 循环末尾添加：
-                    del cv_img
-                    del msg
-            # 补偿剩余进度
+
             if update_batch > 0:
                 progress_queue.put({"task_id": task_id, "type": "advance", "value": update_batch})
 
-            progress_queue.put({"task_id": task_id, "type": "description", "value": f"[green]已完成 {folder_name} (共{img_count}组)"})
+            progress_queue.put({"task_id": task_id, "type": "description", "value": f"[green]已完成 {folder_name} (匹配{img_count}组)"})
             progress_queue.put({"task_id": task_id, "type": "done"})
 
         except Exception as e:
-            progress_queue.put({"task_id": task_id, "type": "description", "value": f"[red]处理异常: {folder_name}"})
+            progress_queue.put({"task_id": task_id, "type": "description", "value": f"[red]异常: {str(e)[:20]}"})
             progress_queue.put({"task_id": task_id, "type": "done"})
 
     def extract(self):
-        print(f"准备并发处理 {len(self.folder_map)} 个数据包 (使用多进程)...")
-        
-        # 初始化进程安全的队列管理器
+        print(f"准备并发处理 {len(self.folder_map)} 个数据包...")
         manager = multiprocessing.Manager()
         progress_queue = manager.Queue()
 
-        # 配置 rich 进度条的 UI 布局
         progress = Progress(
             SpinnerColumn(),
             TextColumn("[bold width=30]{task.description}"),
@@ -210,60 +215,27 @@ class RosBagExtractor:
         )
 
         def update_progress_thread():
-            """在主进程后台持续监听消息并更新 UI"""
             while True:
-                try:
-                    msg = progress_queue.get()
-                    if msg is None:  # 收到退出指令
-                        break
-                    
-                    task_id = msg['task_id']
-                    if msg['type'] == 'total':
-                        progress.update(task_id, total=msg['value'])
-                    elif msg['type'] == 'advance':
-                        progress.advance(task_id, advance=msg['value'])
-                    elif msg['type'] == 'description':
-                        progress.update(task_id, description=msg['value'])
-                    elif msg['type'] == 'done':
-                        # 若任务完成但进度未满，直接填满
-                        current_task = progress.tasks[task_id]
-                        if current_task.total is None:
-                            progress.update(task_id, total=100, completed=100)
-                        else:
-                            progress.update(task_id, completed=current_task.total)
-                except Exception:
-                    pass
+                msg = progress_queue.get()
+                if msg is None: break
+                task_id = msg['task_id']
+                if msg['type'] == 'total': progress.update(task_id, total=msg['value'])
+                elif msg['type'] == 'advance': progress.advance(task_id, advance=msg['value'])
+                elif msg['type'] == 'description': progress.update(task_id, description=msg['value'])
+                elif msg['type'] == 'done':
+                    current_task = progress.tasks[task_id]
+                    progress.update(task_id, completed=current_task.total or 100)
 
-        # 启动 rich 进度条上下文
         with progress:
-            # 预设任务占位符
-            tasks = {}
-            for folder_name in self.folder_map.keys():
-                # 初始 total=None，呈现不确定状态，直到完成标签读取再设定总量
-                task_id = progress.add_task(f"[cyan]等待中: {folder_name}", total=None)
-                tasks[folder_name] = task_id
-
-            # 启动监听线程
+            tasks = {name: progress.add_task(f"[cyan]等待中: {name}", total=None) for name in self.folder_map.keys()}
             listener = threading.Thread(target=update_progress_thread)
             listener.start()
 
             with ProcessPoolExecutor(max_workers=6) as executor:
-                futures = []
-                for folder_name, target_id in self.folder_map.items():
-                    futures.append(
-                        executor.submit(
-                            self.process_single_bag, 
-                            folder_name, 
-                            target_id, 
-                            progress_queue, 
-                            tasks[folder_name]
-                        )
-                    )
-                # 等待所有进程结束
-                for future in futures:
-                    future.result()
+                futures = [executor.submit(self.process_single_bag, name, tid, progress_queue, tasks[name]) 
+                          for name, tid in self.folder_map.items()]
+                for f in futures: f.result()
 
-            # 关闭监听线程
             progress_queue.put(None)
             listener.join()
 
@@ -271,7 +243,6 @@ if __name__ == '__main__':
     source_path = "~/DT46_V/install/setup.bash"
 
     if "DT46_V" not in os.environ.get("LD_LIBRARY_PATH", ""):
-        print("检测到环境未完全加载，正在重新注入环境变量并重启脚本...")
         source_env(source_path)
         os.execv(sys.executable, ['python3'] + sys.argv)
 
