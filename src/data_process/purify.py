@@ -77,7 +77,7 @@ def io_worker(task_queue, progress_bar):
         progress_bar.update(1)
         task_queue.task_done()
 
-def clean_dataset_pipeline(raw_dir: str, output_dir: str, distance_threshold: float = 10.0, num_workers: int = 4):
+def purify_dataset_pipeline(raw_dir: str, output_dir: str, distance_threshold: float = 10.0, num_workers: int = 4):
     raw_path = Path(raw_dir)
     out_path = Path(output_dir)
 
@@ -202,9 +202,9 @@ def clean_dataset_pipeline(raw_dir: str, output_dir: str, distance_threshold: fl
 
 
 if __name__ == "__main__":
-    clean_dataset_pipeline(
+    purify_dataset_pipeline(
         raw_dir="./data/raw", 
-        output_dir="./data/clean", 
+        output_dir="./data/purify", 
         distance_threshold=10.0,
         num_workers=4  # 可根据 CPU 核心数和磁盘性能调整工作线程数
     )
