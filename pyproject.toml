@@ -6,6 +6,8 @@ readme = "README.md"
 requires-python = "==3.10"
 dependencies = [
     "cvbridge3>=1.1",
+    "matplotlib>=3.10.8",
+    "numpy>=2.2.6",
     "opencv-python>=4.13.0.92",
     "rich>=14.3.3",
 ]

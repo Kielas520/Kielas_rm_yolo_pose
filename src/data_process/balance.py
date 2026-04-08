@@ -3,10 +3,26 @@ import threading
 import random
 from pathlib import Path
 from queue import Queue
-from tqdm import tqdm
 from collections import defaultdict
+from typing import Dict, List, Tuple, Optional
 
-def io_worker(task_queue, progress_bar):
+# 引入 rich 组件
+from rich.console import Console
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeRemainingColumn, ProgressColumn
+from rich.table import Table
+from rich.panel import Panel
+from rich.text import Text
+
+console = Console()
+
+class MofNCompleteColumn(ProgressColumn):
+    """自定义列显示 n/m 格式"""
+    def render(self, task):
+        completed = int(task.completed)
+        total = int(task.total) if task.total is not None else "?"
+        return Text(f"{completed}/{total}", style="progress.remaining")
+
+def io_worker(task_queue: Queue, progress: Progress, task_id):
     """
     后台 I/O 线程：负责读取旧标签、剔除 color 字段、写入新标签以及拷贝图片
     """
@@ -19,57 +35,51 @@ def io_worker(task_queue, progress_bar):
         in_label, out_label, in_photo, out_photo = task
         
         # 1. 重新格式化标签：剔除 color (索引为 1 的列)
-        with open(in_label, 'r', encoding='utf-8') as f:
-            lines = f.readlines()
+        try:
+            with open(in_label, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
+                
+            new_lines = []
+            for line in lines:
+                parts = line.strip().split()
+                if len(parts) >= 10: 
+                    parts.pop(1)  # 移除 color 列
+                    new_lines.append(" ".join(parts) + "\n")
+                
+            with open(out_label, 'w', encoding='utf-8') as f:
+                f.writelines(new_lines)
+                
+            # 2. 拷贝图片文件
+            if in_photo and in_photo.exists() and out_photo:
+                shutil.copy2(in_photo, out_photo)
+        except Exception as e:
+            console.print(f"[red]错误处理文件 {in_label.name}: {e}[/red]")
             
-        new_lines = []
-        for line in lines:
-            parts = line.strip().split()
-            # 确保是有效数据行 (至少包含 class_id, color 和 8个角点坐标)
-            if len(parts) >= 10: 
-                parts.pop(1)  # 移除 color 列
-                new_lines.append(" ".join(parts) + "\n")
-            
-        # 写入剔除了 color 的新格式
-        with open(out_label, 'w', encoding='utf-8') as f:
-            f.writelines(new_lines)
-            
-        # 2. 拷贝图片文件
-        if in_photo and in_photo.exists() and out_photo:
-            shutil.copy2(in_photo, out_photo)
-            
-        progress_bar.update(1)
+        progress.advance(task_id)
         task_queue.task_done()
 
 def generate_yaml(output_dir: Path, class_counts: dict, class_weights: dict):
-    """
-    生成类似 YOLO 的 train.yaml 配置文件，去除 color 定义
-    """
+    """生成类似 YOLO 的 train.yaml 配置文件"""
     yaml_path = output_dir / "train.yaml"
     sorted_cids = sorted(class_counts.keys(), key=lambda x: int(x) if x.isdigit() else x)
     
     yaml_content = f"""# Train Dataset Configuration
-path: {output_dir.absolute()}  # 数据集绝对根目录
-train: ./  # 训练集相对路径
-val: ./    # 验证集相对路径 (视实际划分情况而定)
+path: {output_dir.absolute()}
+train: ./
+val: ./
 
-# 类别数量
 nc: {len(class_counts)}
 
-# 类别名称映射
 names:
 """
     for cid in sorted_cids:
         yaml_content += f"  {cid}: '{cid}'\n"
 
-    yaml_content += "\n# 类别权重 (用于辅助训练时的 Loss 计算)\nweights:\n"
+    yaml_content += "\nweights:\n"
     for cid in sorted_cids:
         yaml_content += f"  {cid}: {class_weights[cid]:.4f}\n"
 
-    # 移除了 color 的特征说明
     yaml_content += """
-# 数据特征格式定义 (Label Format)
-# [class_id, l_down_x, l_down_y, l_up_x, l_up_y, r_down_x, r_down_y, r_up_x, r_up_y, center_x, center_y]
 features_description:
   - class_id
   - left_light_down_x
@@ -91,98 +101,106 @@ def balance_dataset_pipeline(input_dir: str, output_dir: str, max_samples_per_cl
     out_path = Path(output_dir)
 
     if not in_path.exists():
-        print(f"错误：找不到输入目录 {in_path}")
+        console.print(f"[bold red]错误：[/bold red]找不到输入目录 {in_path}")
         return
 
     # 1. 扫描与统计
     class_files = defaultdict(list)
-    for class_dir in in_path.iterdir():
-        if not class_dir.is_dir():
-            continue
-        
-        class_id = class_dir.name
-        labels_dir = class_dir / "labels"
-        photos_dir = class_dir / "photos"
+    with console.status("[bold green]正在扫描原始数据并分析类别分布..."):
+        for class_dir in in_path.iterdir():
+            if not class_dir.is_dir(): continue
+            
+            class_id = class_dir.name
+            labels_dir = class_dir / "labels"
+            photos_dir = class_dir / "photos"
 
-        if not labels_dir.exists():
-            continue
+            if not labels_dir.exists(): continue
 
-        for label_file in labels_dir.glob("*.txt"):
-            photo_file = None
-            for ext in ['.jpg', '.png', '.jpeg']:
-                temp_photo = photos_dir / (label_file.stem + ext)
-                if temp_photo.exists():
-                    photo_file = temp_photo
-                    break
-            class_files[class_id].append((label_file, photo_file))
+            for label_file in labels_dir.glob("*.txt"):
+                photo_file = None
+                for ext in ['.jpg', '.png', '.jpeg']:
+                    temp_photo = photos_dir / (label_file.stem + ext)
+                    if temp_photo.exists():
+                        photo_file = temp_photo
+                        break
+                class_files[class_id].append((label_file, photo_file))
 
     if not class_files:
-        print("未扫描到有效数据文件。")
+        console.print("[yellow]未扫描到有效数据文件。[/yellow]")
         return
 
-    # 2. 下采样与权重计算策略
+    # 2. 下采样策略预览
     selected_files = {}
-    for cid, files in class_files.items():
+    strategy_table = Table(title="数据集平衡策略预览", header_style="bold magenta")
+    strategy_table.add_column("类别 ID", justify="center")
+    strategy_table.add_column("原始数量", justify="right")
+    strategy_table.add_column("下采样后", justify="right", style="green")
+    strategy_table.add_column("训练权重", justify="right", style="cyan")
+
+    for cid in sorted(class_files.keys(), key=lambda x: int(x) if x.isdigit() else x):
+        files = class_files[cid]
         if len(files) > max_samples_per_class:
             selected_files[cid] = random.sample(files, max_samples_per_class)
         else:
             selected_files[cid] = files
+        
+        orig_cnt = len(files)
+        new_cnt = len(selected_files[cid])
+        # 暂时记录，稍后计算权重
+        strategy_table.add_row(cid, str(orig_cnt), str(new_cnt), "CALC...")
 
-    class_counts = {cid: len(files) for cid, files in selected_files.items()}
+    class_counts = {cid: len(f) for cid, f in selected_files.items()}
     max_count = max(class_counts.values())
-    
-    # 权重公式
     class_weights = {cid: max_count / count for cid, count in class_counts.items()}
-    total_tasks = sum(class_counts.values())
 
-    # 打印平衡策略信息
-    print("\n" + "="*45)
-    print("数据集平衡策略预览：")
-    for cid in sorted(class_counts.keys(), key=lambda x: int(x) if x.isdigit() else x):
-        orig_cnt = len(class_files[cid])
-        new_cnt = class_counts[cid]
-        w = class_weights[cid]
-        print(f"类 {cid:<3} | 原数量: {orig_cnt:<6} -> 下采样: {new_cnt:<6} | 权重: {w:.4f}")
-    print("="*45 + "\n")
+    # 更新表格中的权重列
+    for i, cid in enumerate(sorted(class_counts.keys(), key=lambda x: int(x) if x.isdigit() else x)):
+        strategy_table.columns[3]._cells[i] = f"{class_weights[cid]:.4f}"
 
-    # 3. 创建输出根目录并生成 train.yaml
+    console.print(strategy_table)
+    console.print(f"\n[bold]总处理任务数:[/bold] [yellow]{sum(class_counts.values())}[/yellow]\n")
+
+    # 3. 创建输出并生成 YAML
     out_path.mkdir(parents=True, exist_ok=True)
     generate_yaml(out_path, class_counts, class_weights)
 
-    # 4. 初始化多线程 Pipeline
-    io_queue = Queue(maxsize=1000)
-    pbar = tqdm(total=total_tasks, desc="数据转换与转移进度", unit="张")
-    
-    workers = []
-    for _ in range(num_workers):
-        t = threading.Thread(target=io_worker, args=(io_queue, pbar), daemon=True)
-        t.start()
-        workers.append(t)
+    # 4. 执行多线程转换
+    progress = Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+        MofNCompleteColumn(),
+        TimeRemainingColumn(),
+        console=console
+    )
 
-    # 5. 下发主线程任务
-    for cid, files in selected_files.items():
-        out_class_dir = out_path / cid
-        out_labels_dir = out_class_dir / "labels"
-        out_photos_dir = out_class_dir / "photos"
+    with progress:
+        main_task = progress.add_task("[cyan]转换与转移进度", total=sum(class_counts.values()))
+        io_queue = Queue(maxsize=1000)
         
-        out_labels_dir.mkdir(parents=True, exist_ok=True)
-        out_photos_dir.mkdir(parents=True, exist_ok=True)
+        workers = []
+        for _ in range(num_workers):
+            t = threading.Thread(target=io_worker, args=(io_queue, progress, main_task), daemon=True)
+            t.start()
+            workers.append(t)
 
-        for label_file, photo_file in files:
-            out_label = out_labels_dir / label_file.name
-            out_photo = out_photos_dir / photo_file.name if photo_file else None
-            
-            io_queue.put((label_file, out_label, photo_file, out_photo))
+        for cid, files in selected_files.items():
+            out_class_dir = out_path / cid
+            (out_class_dir / "labels").mkdir(parents=True, exist_ok=True)
+            (out_class_dir / "photos").mkdir(parents=True, exist_ok=True)
 
-    # 6. 等待队列及线程完成
-    for _ in range(num_workers):
-        io_queue.put(None)
-        
-    for t in workers:
-        t.join()
+            for label_file, photo_file in files:
+                out_label = out_class_dir / "labels" / label_file.name
+                out_photo = out_class_dir / "photos" / photo_file.name if photo_file else None
+                io_queue.put((label_file, out_label, photo_file, out_photo))
 
-    pbar.close()
-    print(f"\n✨ 处理完毕！剔除了 color 的数据集与 train.yaml 已保存至: {out_path.absolute()}")
+        for _ in range(num_workers):
+            io_queue.put(None)
+        for t in workers:
+            t.join()
+
+    console.print(Panel(f"✨ [bold green]处理完毕！[/bold green]\n\n数据已保存至: [underline]{out_path.absolute()}[/underline]\n配置文件: [cyan]train.yaml[/cyan]", border_style="green"))
 
 if __name__ == "__main__":
     balance_dataset_pipeline(
