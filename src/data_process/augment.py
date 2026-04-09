@@ -6,6 +6,9 @@ import threading
 import copy
 from pathlib import Path
 from queue import Queue
+from dataclasses import dataclass
+from typing import Tuple
+import yaml
 
 # 引入 rich 组件
 from rich.console import Console
@@ -19,6 +22,47 @@ from rich.text import Text
 
 console = Console()
 
+@dataclass
+class AugmentConfig:
+    """图像增强配置参数类"""
+    brightness_prob: float = 0.8
+    brightness_range: Tuple[float, float] = (0.6, 1.4)
+    flip_prob: float = 0.5
+    scale_prob: float = 0.5
+    scale_range: Tuple[float, float] = (0.8, 1.2)
+    rotate_prob: float = 0.5
+    rotate_range: Tuple[float, float] = (-15, 15)
+    occ_prob: float = 0.5
+    occ_radius_pct: float = 0.2
+    occ_size_pct: Tuple[float, float] = (0.05, 0.15)
+    vis_heavy_threshold: float = 0.7
+    vis_part_threshold: float = 0.1
+
+    @staticmethod
+    def from_yaml(yaml_path: str):
+        """从 yaml 配置文件加载参数"""
+        cfg = AugmentConfig()
+        try:
+            with open(yaml_path, 'r', encoding='utf-8') as f:
+                data = yaml.safe_load(f)
+                # 定位到 config.yaml 中的 augment 层级
+                aug_data = data.get('kielas_rm_model', {}).get('dataset', {}).get('augment', {})
+                
+                if aug_data:
+                    # 遍历 yaml 中的键值对，如果匹配则更新
+                    for key, value in aug_data.items():
+                        if hasattr(cfg, key):
+                            # 处理元组类型 (yaml 读入通常是 list)
+                            if isinstance(value, list) and len(value) == 2:
+                                value = tuple(value)
+                            setattr(cfg, key, value)
+                    console.print(f"[green]已从 {yaml_path} 加载增强配置[/green]")
+                else:
+                    console.print("[yellow]YAML 中未发现 augment 配置，使用默认参数[/yellow]")
+        except Exception as e:
+            console.print(f"[red]加载 YAML 失败: {e}，将使用默认参数[/red]")
+        return cfg
+
 class MofNCompleteColumn(ProgressColumn):
     """自定义列显示 n/m 格式"""
     def render(self, task):
@@ -28,18 +72,13 @@ class MofNCompleteColumn(ProgressColumn):
 
 
 def parse_labels(label_lines, filename=""):
-    """
-    解析标签，向下兼容 9个值 和 10个值。
-    返回结构化字典列表。
-    """
+    """解析标签，向下兼容 9个值 和 10个值"""
     parsed = []
     for line in label_lines:
         clean_line = line.replace(',', ' ').strip()
         parts = clean_line.split()
-        
         if not parts or len(parts) < 9:
             continue
-            
         class_id = parts[0]
         try:
             if len(parts) == 9:
@@ -48,21 +87,14 @@ def parse_labels(label_lines, filename=""):
             else:
                 visibility = int(float(parts[1]))
                 pts = np.array([float(x) for x in parts[2:10]]).reshape(-1, 2)
-            
-            parsed.append({
-                'class_id': class_id, 
-                'vis': visibility, 
-                'pts': pts
-            })
+            parsed.append({'class_id': class_id, 'vis': visibility, 'pts': pts})
         except ValueError:
             continue
     return parsed
 
 
 def format_labels(labels):
-    """
-    将结构化的标签转回字符串列表以供写入文件
-    """
+    """将结构化标签转回字符串列表"""
     new_lines = []
     for lab in labels:
         pts_flat = lab['pts'].flatten()
@@ -71,40 +103,55 @@ def format_labels(labels):
     return new_lines
 
 
-def process_data(img, labels, brightness_range, occ_radius_pct=0.2):
-    """
-    同步处理图像与标签增强。
-    occ_radius_pct: 遮挡半径占图像宽度的百分比。
-    """
+def process_data(img, labels, cfg: AugmentConfig):
+    """同步处理图像与标签增强"""
     aug_img = img.copy()
-    # 深拷贝避免修改原始数据
-    aug_labels = copy.deepcopy(labels) 
-    
-    # 1. 亮度调整 (不影响标签坐标)
-    if random.random() < 0.8:
-        factor = random.uniform(*brightness_range)
-        aug_img = np.clip(aug_img.astype(np.float32) * factor, 0, 255).astype(np.uint8)
+    aug_labels = copy.deepcopy(labels)
+    h, w = aug_img.shape[:2]
         
+    # 1. 亮度调整
+    if random.random() < cfg.brightness_prob:
+        factor = random.uniform(*cfg.brightness_range)
+        aug_img = np.clip(aug_img.astype(np.float32) * factor, 0, 255).astype(np.uint8)
+    
+    # 1.5 水平翻转 (针对装甲板四角点排序优化)
+    if random.random() < cfg.flip_prob:
+        aug_img = cv2.flip(aug_img, 1)  # 1 表示水平翻转
+        for lab in aug_labels:
+            # 1. 翻转所有坐标点的 x 值：新 x = 图像宽度 - 原 x
+            lab['pts'][:, 0] = w - lab['pts'][:, 0]
+            
+            # 2. 重新排序点位以符合定义:
+            # 原顺序: [0:左下, 1:左上, 2:右下, 3:右上]
+            # 翻转后: 原左下变为右下，原左上变为右上，以此类推
+            # 因此需要执行交换：(左下 <-> 右下), (左上 <-> 右上)
+            
+            # 暂存翻转后的点数据
+            old_pts = lab['pts'].copy()
+            
+            # 执行索引交换
+            lab['pts'][0] = old_pts[2]  # 新左下 = 旧右下
+            lab['pts'][1] = old_pts[3]  # 新左上 = 旧右上
+            lab['pts'][2] = old_pts[0]  # 新右下 = 旧左下
+            lab['pts'][3] = old_pts[1]  # 新右上 = 旧左上
+
     # 2. 随机 Resize 
-    if random.random() < 0.5:
-        scale = random.uniform(0.8, 1.2)
+    if random.random() < cfg.scale_prob:
+        scale = random.uniform(*cfg.scale_range)
         aug_img = cv2.resize(aug_img, None, fx=scale, fy=scale)
         for lab in aug_labels:
             lab['pts'] = lab['pts'] * scale
+        h, w = aug_img.shape[:2] # 更新当前尺寸
             
     # 3. 旋转处理
-    if random.random() < 0.5:
-        h, w = aug_img.shape[:2]
-        angle = random.uniform(-15, 15)
+    if random.random() < cfg.rotate_prob:
+        angle = random.uniform(*cfg.rotate_range)
         center = (w / 2, h / 2)
-        
         M = cv2.getRotationMatrix2D(center, angle, 1.0)
         aug_img = cv2.warpAffine(aug_img, M, (w, h))
         
-        # 同步旋转坐标点
         theta = np.radians(-angle) 
         cos_t, sin_t = np.cos(theta), np.sin(theta)
-        
         for lab in aug_labels:
             pts = lab['pts'] - np.array(center)
             rotated_pts = np.empty_like(pts)
@@ -113,54 +160,39 @@ def process_data(img, labels, brightness_range, occ_radius_pct=0.2):
             lab['pts'] = rotated_pts + np.array(center)
 
     # 4. 围绕目标的随机遮挡 (Cutout)
-    if aug_labels and random.random() < 0.5:
-        h, w = aug_img.shape[:2]
-        # 半径: (图像x轴长度 * 百分比) / 2
-        radius = (w * occ_radius_pct) / 2.0
-        
+    if aug_labels and random.random() < cfg.occ_prob:
+        radius = (w * cfg.occ_radius_pct) / 2.0
         occ_boxes = []
         
         for lab in aug_labels:
-            # 每个目标有 50% 概率触发周围遮挡
             if random.random() < 0.5:
-                # 获取当前变换后的目标中心点
                 tx, ty = np.mean(lab['pts'], axis=0)
-                
-                # 在半径范围内随机取点作为遮挡块中心
                 angle = random.uniform(0, 2 * np.pi)
                 dist = random.uniform(0, radius)
-                cx = tx + dist * np.cos(angle)
-                cy = ty + dist * np.sin(angle)
+                cx, cy = tx + dist * np.cos(angle), ty + dist * np.sin(angle)
                 
-                # 随机生成遮挡块宽高 (例如图像宽高的 5% 到 15%)
-                occ_w = int(w * random.uniform(0.05, 0.15))
-                occ_h = int(h * random.uniform(0.05, 0.15))
+                occ_w = int(w * random.uniform(*cfg.occ_size_pct))
+                occ_h = int(h * random.uniform(*cfg.occ_size_pct))
                 
-                # 遮挡块左上角和右下角
-                occ_x1 = int(cx - occ_w / 2)
-                occ_y1 = int(cy - occ_h / 2)
-                occ_x2 = occ_x1 + occ_w
-                occ_y2 = occ_y1 + occ_h
-                
+                occ_x1, occ_y1 = int(cx - occ_w / 2), int(cy - occ_h / 2)
+                occ_x2, occ_y2 = occ_x1 + occ_w, occ_y1 + occ_h
                 occ_boxes.append((occ_x1, occ_y1, occ_x2, occ_y2))
                 
-                # 在图像上绘制黑色遮挡块 (注意截断防越界)
                 draw_y1, draw_y2 = max(0, occ_y1), min(h, occ_y2)
                 draw_x1, draw_x2 = max(0, occ_x1), min(w, occ_x2)
                 if draw_y1 < draw_y2 and draw_x1 < draw_x2:
                     aug_img[draw_y1:draw_y2, draw_x1:draw_x2] = 0
         
-        # 统一计算遮挡对可见度的影响
         if occ_boxes:
             for lab in aug_labels:
-                # 1. 保留原有的点遮挡判断（作为基础辅助）
+                # 基于点的遮挡辅助判断
                 covered_points = 0
                 for pt in lab['pts']:
                     px, py = pt[0], pt[1]
                     if any(x1 <= px <= x2 and y1 <= py <= y2 for x1, y1, x2, y2 in occ_boxes):
                         covered_points += 1
 
-                # 2. 新增：基于目标外接矩形(Bounding Box)的面积遮挡判断
+                # 基于面积的遮挡判断
                 pts = lab['pts']
                 min_x, min_y = np.min(pts, axis=0)
                 max_x, max_y = np.max(pts, axis=0)
@@ -171,23 +203,15 @@ def process_data(img, labels, brightness_range, occ_radius_pct=0.2):
 
                 if target_area > 0:
                     for x1, y1, x2, y2 in occ_boxes:
-                        # 计算遮挡块与目标 Bbox 的交集区域
-                        ix1 = max(min_x, x1)
-                        iy1 = max(min_y, y1)
-                        ix2 = min(max_x, x2)
-                        iy2 = min(max_y, y2)
-                        
+                        ix1, iy1 = max(min_x, x1), max(min_y, y1)
+                        ix2, iy2 = min(max_x, x2), min(max_y, y2)
                         if ix1 < ix2 and iy1 < iy2:
-                            inter_area = (ix2 - ix1) * (iy2 - iy1)
-                            overlap_ratio = inter_area / target_area
-                            
-                            # 可以根据实际需求调整阈值
-                            if overlap_ratio > 0.7:  # 遮挡超过 70% 视为完全遮挡
+                            overlap_ratio = ((ix2 - ix1) * (iy2 - iy1)) / target_area
+                            if overlap_ratio > cfg.vis_heavy_threshold:
                                 is_heavily_occluded = True
-                            elif overlap_ratio > 0.1:  # 遮挡超过 10% 视为部分遮挡
+                            elif overlap_ratio > cfg.vis_part_threshold:
                                 is_partially_occluded = True
 
-                # 综合判定可见度
                 if covered_points == 4 or is_heavily_occluded:
                     lab['vis'] = 0
                 elif covered_points > 0 or is_partially_occluded:
@@ -196,120 +220,61 @@ def process_data(img, labels, brightness_range, occ_radius_pct=0.2):
     return aug_img, aug_labels
 
 
-def augment_worker(task_queue: Queue, progress: Progress, task_id, brightness_range, occ_radius_pct):
-    """
-    后台线程：负责读取数据并执行同步增强处理
-    """
+def augment_worker(task_queue: Queue, progress: Progress, task_id, cfg: AugmentConfig):
+    """后台线程：执行增强处理任务"""
     while True:
         task = task_queue.get()
-        if task is None:
-            break
-            
+        if task is None: break
         img_path, out_img_path, label_path, out_label_path = task
-        
         try:
-            # 1. 读取标签文件
             parsed_labels = []
             if label_path.exists():
                 with open(label_path, 'r') as f:
-                    label_lines = f.readlines()
-                parsed_labels = parse_labels(label_lines, filename=label_path.name)
-            else:
-                progress.console.print(f"[yellow]未找到标签文件 {label_path.name}[/yellow]")
-
-            # 2. 读取图像
+                    parsed_labels = parse_labels(f.readlines(), filename=label_path.name)
+            
             img = cv2.imread(str(img_path))
             if img is None:
-                progress.console.print(f"[red]图像读取失败 {img_path.name}[/red]")
                 progress.advance(task_id)
                 task_queue.task_done()
                 continue
                 
-            # 3. 同步执行增强处理
-            aug_img, aug_labels = process_data(
-                img, 
-                parsed_labels, 
-                brightness_range, 
-                occ_radius_pct
-            )
-            
-            # 4. 保存增强后的图像
+            aug_img, aug_labels = process_data(img, parsed_labels, cfg)
             cv2.imwrite(str(out_img_path), aug_img)
             
-            # 5. 保存增强后的标签
             new_label_lines = format_labels(aug_labels)
             with open(out_label_path, 'w') as f:
                 if new_label_lines:
                     f.write("\n".join(new_label_lines) + "\n")
-                    
-            if not new_label_lines and label_path.exists():
-                 progress.console.print(f"[yellow]警告: {label_path.name} 处理后无有效标签[/yellow]")
-                
         except Exception as e:
-            progress.console.print(f"[red]文件处理异常 {img_path.name}: {e}[/red]")
-            
+            progress.console.print(f"[red]处理异常 {img_path.name}: {e}[/red]")
         progress.advance(task_id)
         task_queue.task_done()
 
 
 def generate_yaml(output_dir: Path):
-    """扫描输出目录并生成 train.yaml 配置文件"""
+    """生成 train.yaml 配置文件"""
     yaml_path = output_dir / "train.yaml"
-    
     class_counts = {}
     for class_dir in output_dir.iterdir():
-        if not class_dir.is_dir():
-            continue
-            
-        labels_dir = class_dir / "labels"
-        if labels_dir.exists():
-            count = len(list(labels_dir.glob("*.txt")))
-            if count > 0:
-                class_counts[class_dir.name] = count
+        if class_dir.is_dir() and (class_dir / "labels").exists():
+            count = len(list((class_dir / "labels").glob("*.txt")))
+            if count > 0: class_counts[class_dir.name] = count
 
-    if not class_counts:
-        console.print("[yellow]未发现有效标签数据，跳过生成 yaml。[/yellow]")
-        return
-
+    if not class_counts: return
     max_count = max(class_counts.values())
     class_weights = {cid: max_count / count for cid, count in class_counts.items()}
     sorted_cids = sorted(class_counts.keys(), key=lambda x: int(x) if x.isdigit() else x)
 
-    yaml_content = f"# Train Dataset Configuration\n"
-    yaml_content += f"path: {output_dir.absolute()}\n"
-    yaml_content += f"train: ./\n"
-    yaml_content += f"val: ./\n\n"
-    yaml_content += f"nc: {len(class_counts)}\n\n"
-    
-    yaml_content += "names:\n"
-    for cid in sorted_cids:
-        yaml_content += f"  {cid}: '{cid}'\n"
-
-    yaml_content += "\nweights:\n"
-    for cid in sorted_cids:
-        yaml_content += f"  {cid}: {class_weights[cid]:.4f}\n"
-
-    yaml_content += """
-features_description:
-  - class_id
-  - visibility
-  - left_light_down_x
-  - left_light_down_y
-  - left_light_up_x
-  - left_light_up_y
-  - right_light_down_x
-  - right_light_down_y
-  - right_light_up_x
-  - right_light_up_y
-"""
-
-    with open(yaml_path, 'w', encoding='utf-8') as f:
-        f.write(yaml_content)
+    content = f"path: {output_dir.absolute()}\ntrain: ./\nval: ./\nnc: {len(class_counts)}\n\nnames:\n"
+    for cid in sorted_cids: content += f"  {cid}: '{cid}'\n"
+    content += "\nweights:\n"
+    for cid in sorted_cids: content += f"  {cid}: {class_weights[cid]:.4f}\n"
+    with open(yaml_path, 'w', encoding='utf-8') as f: f.write(content)
 
 
-def run_augment_pipeline(input_dir: str, output_dir: str, num_workers: int = 8, brightness_range=(0.6, 1.4), occ_radius_pct=0.2):
-    in_path = Path(input_dir)
-    out_path = Path(output_dir)
+def run_augment_pipeline(input_dir: str, output_dir: str, num_workers: int = 8, cfg: AugmentConfig = None):
+    if cfg is None: cfg = AugmentConfig()
+    in_path, out_path = Path(input_dir), Path(output_dir)
 
     if not in_path.exists():
         console.print(f"[bold red]错误：[/bold red]找不到输入目录 {in_path}")
@@ -319,94 +284,64 @@ def run_augment_pipeline(input_dir: str, output_dir: str, num_workers: int = 8, 
     with console.status("[bold green]正在扫描原始数据..."):
         for class_dir in in_path.iterdir():
             if not class_dir.is_dir(): continue
-            
-            class_id = class_dir.name
-            photos_dir = class_dir / "photos"
-            labels_dir = class_dir / "labels"
-
+            photos_dir, labels_dir = class_dir / "photos", class_dir / "labels"
             if not photos_dir.exists(): continue
-
             for img_file in photos_dir.glob("*.jpg"):
                 label_file = labels_dir / (img_file.stem + ".txt")
-                
-                out_class_dir = out_path / class_id
-                out_img = out_class_dir / "photos" / f"aug_{img_file.name}"
-                out_lab = out_class_dir / "labels" / f"aug_{label_file.name}"
-                
-                tasks.append((img_file, out_img, label_file, out_lab))
+                out_class_dir = out_path / class_dir.name
+                tasks.append((img_file, out_class_dir / "photos" / f"aug_{img_file.name}", 
+                              label_file, out_class_dir / "labels" / f"aug_{label_file.name}"))
 
-    if not tasks:
-        console.print("[yellow]未发现可处理的图片数据。[/yellow]")
-        return
-
-    if out_path.exists():
-        with console.status(f"[bold red]正在清理旧数据: {output_dir}..."):
-            shutil.rmtree(out_path)
+    if not tasks: return
+    if out_path.exists(): shutil.rmtree(out_path)
     out_path.mkdir(parents=True, exist_ok=True)
 
+    # 打印配置信息
     table = Table(title="数据增强流水线", header_style="bold cyan")
-    table.add_column("输入目录", style="dim")
-    table.add_column("输出目录")
-    table.add_column("总任务数", justify="right", style="green")
-    table.add_column("增强策略", justify="center")
-    table.add_row(input_dir, output_dir, str(len(tasks)), "亮度/缩放/旋转/目标周围遮挡")
+    table.add_column("配置项")
+    table.add_column("当前值")
+    table.add_row("输入/输出", f"{input_dir} -> {output_dir}")
+    table.add_row("并行线程数", str(num_workers))
+    table.add_row("亮度范围", f"{cfg.brightness_range} (概率:{cfg.brightness_prob})")
+    table.add_row("水平翻转概率", f"{cfg.flip_prob}") 
+    table.add_row("旋转角度", f"{cfg.rotate_range}")
+    table.add_row("遮挡半径占比", f"{cfg.occ_radius_pct}")
     console.print(table)
 
-    progress = Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(bar_width=40),
-        TaskProgressColumn(),
-        MofNCompleteColumn(),
-        TimeRemainingColumn(),
-        console=console
-    )
+    progress = Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
+                        BarColumn(bar_width=40), TaskProgressColumn(), MofNCompleteColumn(),
+                        TimeRemainingColumn(), console=console)
 
     with progress:
-        main_task = progress.add_task("[magenta]混合增强处理中...", total=len(tasks))
+        main_task = progress.add_task("[magenta]执行增强处理...", total=len(tasks))
         task_queue = Queue(maxsize=2000)
-        
-        threads = []
-        for _ in range(num_workers):
-            t = threading.Thread(
-                target=augment_worker, 
-                args=(task_queue, progress, main_task, brightness_range, occ_radius_pct),
-                daemon=True
-            )
-            t.start()
-            threads.append(t)
+        threads = [threading.Thread(target=augment_worker, args=(task_queue, progress, main_task, cfg), daemon=True) 
+                   for _ in range(num_workers)]
+        for t in threads: t.start()
 
         created_dirs = set()
         for t in tasks:
-            out_img_parent = t[1].parent
-            out_lab_parent = t[3].parent
-            
-            if out_img_parent not in created_dirs:
-                out_img_parent.mkdir(parents=True, exist_ok=True)
-                out_lab_parent.mkdir(parents=True, exist_ok=True)
-                created_dirs.add(out_img_parent)
-            
+            if t[1].parent not in created_dirs:
+                t[1].parent.mkdir(parents=True, exist_ok=True)
+                t[3].parent.mkdir(parents=True, exist_ok=True)
+                created_dirs.add(t[1].parent)
             task_queue.put(t)
 
-        for _ in range(num_workers):
-            task_queue.put(None)
-        
-        for t in threads:
-            t.join()
+        for _ in range(num_workers): task_queue.put(None)
+        for t in threads: t.join()
 
     generate_yaml(out_path)
-
-    console.print(Panel(
-        f"✅ [bold green]增强处理完成！[/bold green]\n\n数据路径: [underline]{out_path.absolute()}[/underline]\n配置文件: [cyan]{(out_path / 'train.yaml').absolute()}[/cyan]\n处理总数: {len(tasks)}", 
-        border_style="green",
-        title="Success"
-    ))
+    console.print(Panel(f"✅ 处理完成！总数: {len(tasks)}", border_style="green", title="Success"))
 
 if __name__ == "__main__":
+    # 1. 从 YAML 加载配置
+    config_path = "config.yaml"
+    config = AugmentConfig.from_yaml(config_path)
+
+    # 2. 执行流水线
     run_augment_pipeline(
         input_dir="./data/balance", 
         output_dir="./data/augment", 
-        num_workers=8, 
-        brightness_range=(0.6, 1.4),
-        occ_radius_pct=0.2  # 图像x轴长度的 20% 作为直径占比，即 10% 作为半径（可根据需求调整）
+        num_workers=8,
+        cfg=config
     )
