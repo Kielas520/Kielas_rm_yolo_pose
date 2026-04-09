@@ -10,10 +10,11 @@
 | **2** | 蓝方 3号 (B3) or infantry_blue_data | **8** | 红方 3号 (R3) or infantry_red_data |
 | **5** | 蓝方 哨兵 (B7) or sentry_blue_data | **11** | 红方 哨兵 (R7) or sentry_red_data |
 ```bash
-    ros2 bag record -o infantry_red_data /image_raw /detector/armors_debug_info
+    # ros2_bag/
+    ros2 bag record -o infantry_red_data /detector/img_debug /detector/armors_debug_info
 ```
 - 把6份录制的数据文件夹放在 **extract_ros2_bag/original** 文件夹中
-- 使用 [extract.py](extract_ros2_bag/extract.py) 对包进行采样
+- 使用 [extract.py](tools/extract_ros2_bag.py) 对包进行采样
     - 处理好的文件会按照 classid 存放在 **data/raw** 文件夹中
     - labels 会保存在 **data/labels** 文件夹中
     ```

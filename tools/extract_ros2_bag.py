@@ -1,7 +1,6 @@
 import os
 import cv2
 import shutil
-import bisect
 import subprocess
 import rosbag2_py
 from concurrent.futures import ProcessPoolExecutor
@@ -12,16 +11,12 @@ import sys
 from pathlib import Path
 import multiprocessing
 import threading
-import yaml
-import numpy as np
 
-# 引入 rich 相关组件
 from rich.progress import (
     Progress,
     TextColumn,
     BarColumn,
     TaskProgressColumn,
-    TimeElapsedColumn,
     TimeRemainingColumn,
     SpinnerColumn
 )
@@ -53,12 +48,12 @@ class RosBagExtractor:
             "hero_red_data": 6, "infantry_red_data": 8, "sentry_red_data": 11
         }
         self.root_dir = Path(__file__).resolve().parent.parent
-        self.original_dir = self.root_dir / "extract_ros2_bag" / "original"
+        self.original_dir = self.root_dir / "ros2_bag"
         self.raw_data_dir = self.root_dir / "data" / "raw"
 
     @staticmethod
-    def process_single_bag(folder_name, target_id, progress_queue, task_id, diff_tol, original_dir, raw_data_dir):
-        """自适应延迟计算与数据提取"""
+    def process_single_bag(folder_name, target_id, progress_queue, task_id, original_dir, raw_data_dir):
+        """基于精确时间戳的 O(1) 匹配提取"""
         os.environ['RCUTILS_CONSOLE_OUTPUT_FORMAT'] = ''
         os.environ['RCL_LOG_LEVEL'] = '40' 
         from rm_interfaces.msg import ArmorsDebugMsg
@@ -81,53 +76,38 @@ class RosBagExtractor:
         converter_options = rosbag2_py.ConverterOptions(input_serialization_format='cdr', output_serialization_format='cdr')
 
         try:
-            # 1. 预分析：获取图像总数 + 自适应计算延迟
             reader = rosbag2_py.SequentialReader()
             reader.open(storage_options, converter_options)
             
-            # 获取图像总数
+            # 1. 快速扫描获取图像总数
             metadata = reader.get_metadata()
-            total_images = next((t.message_count for t in metadata.topics_with_message_count if t.topic_metadata.name == '/image_raw'), 0)
+            total_images = next((t.message_count for t in metadata.topics_with_message_count if t.topic_metadata.name == '/detector/img_debug'), 0)
             progress_queue.put({"task_id": task_id, "type": "total", "value": total_images})
-            progress_queue.put({"task_id": task_id, "type": "description", "value": "正在计算自适应延迟..."})
+            progress_queue.put({"task_id": task_id, "type": "description", "value": "正在加载标签字典..."})
 
-            # 2. 读取标签并分析延迟分布
-            label_data = []
-            latencies = []
+            # 2. 读取所有标签并建立哈希表 (字典)
+            label_map = {}
             reader.set_filter(rosbag2_py.StorageFilter(topics=['/detector/armors_debug_info']))
             
             while reader.has_next():
-                (topic, data, recv_t) = reader.read_next()
+                (_, data, _) = reader.read_next()
                 msg = deserialize_message(data, ArmorsDebugMsg)
-                header_t = msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec
-                
-                # 计算该帧的延迟：录制时刻 - 逻辑时刻
-                # 录制时刻包含：推理时间 + 传输时间
-                latencies.append(recv_t - header_t)
+                t_ns = msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec
                 
                 armors = [{'id': a.armor_id, 'color': a.color, 'pts': [a.l_light_up_dx, a.l_light_up_dy, a.l_light_down_dx, a.l_light_down_dy, a.r_light_up_dx, a.r_light_up_dy, a.r_light_down_dx, a.r_light_down_dy]} for a in msg.armors_debug]
-                label_data.append({"header_t": header_t, "armors": armors})
+                label_map[t_ns] = armors
 
-            if not label_data:
-                progress_queue.put({"task_id": task_id, "type": "description", "value": "[yellow]无标签消息"})
+            if not label_map:
+                progress_queue.put({"task_id": task_id, "type": "description", "value": "[yellow]无有效标签"})
                 progress_queue.put({"task_id": task_id, "type": "done"})
                 return
 
-            # 使用中位数平滑掉系统抖动产生的延迟偏移
-            adaptive_latency_ns = int(np.median(latencies))
-            # 注意：如果算出来是负数，说明录制时刻不可信，或者 header 有问题，回退到 0
-            adaptive_latency_ns = max(0, adaptive_latency_ns)
-            
-            # 补偿后的标签时间戳序列（尝试对应回图像曝光时间）
-            comp_label_ts = [x["header_t"] - adaptive_latency_ns for x in label_data]
-            
-            desc_info = f"延迟: {adaptive_latency_ns/1e6:.1f}ms"
-            progress_queue.put({"task_id": task_id, "type": "description", "value": f"{desc_info} | 导出中..."})
+            progress_queue.put({"task_id": task_id, "type": "description", "value": "正在精确匹配导出图像..."})
 
-            # 3. 匹配图像
+            # 3. 重新打开读取图像流，直接用时间戳查字典
             reader = rosbag2_py.SequentialReader()
             reader.open(storage_options, converter_options)
-            reader.set_filter(rosbag2_py.StorageFilter(topics=['/image_raw']))
+            reader.set_filter(rosbag2_py.StorageFilter(topics=['/detector/img_debug']))
             
             img_count, batch = 0, 0
             while reader.has_next():
@@ -135,21 +115,14 @@ class RosBagExtractor:
                 msg = deserialize_message(data, Image)
                 img_t = msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec
                 
-                # 寻找最接近补偿后标签的图像
-                idx = bisect.bisect_left(comp_label_ts, img_t)
-                best_idx = -1
-                min_diff = float('inf')
-                for i in [idx-1, idx]:
-                    if 0 <= i < len(comp_label_ts):
-                        diff = abs(img_t - comp_label_ts[i])
-                        if diff < min_diff: min_diff, best_idx = diff, i
-
-                if best_idx != -1 and min_diff < diff_tol:
+                # 精确查字典匹配
+                if img_t in label_map:
                     cv_img = bridge.imgmsg_to_cv2(msg, "bgr8")
                     name = f"{img_count:06d}"
                     cv2.imwrite(str(photo_dir / f"{name}.jpg"), cv_img)
+                    
                     with open(label_dir / f"{name}.txt", 'w') as f:
-                        for a in label_data[best_idx]["armors"]:
+                        for a in label_map[img_t]:
                             f.write(f"{a['id']} {a['color']} {' '.join(map(str, a['pts']))}\n")
                     img_count += 1
                 
@@ -161,12 +134,13 @@ class RosBagExtractor:
             progress_queue.put({"task_id": task_id, "type": "advance", "value": batch})
             progress_queue.put({"task_id": task_id, "type": "description", "value": f"[green]完成 ({img_count}帧)"})
             progress_queue.put({"task_id": task_id, "type": "done"})
+            
         except Exception as e:
-            progress_queue.put({"task_id": task_id, "type": "description", "value": f"[red]异常: {str(e)[:20]}"})
+            progress_queue.put({"task_id": task_id, "type": "description", "value": f"[red]错误: {str(e)[:20]}"})
             progress_queue.put({"task_id": task_id, "type": "done"})
 
-    def extract(self, diff_tol):
-        console.print(f"[bold blue]ROS2 数据自适应对齐提取器[/bold blue]")
+    def extract(self):
+        console.print(f"[bold green]ROS2 数据同步提取器 (精确匹配模式)[/bold green]")
         manager = multiprocessing.Manager()
         progress_queue = manager.Queue()
 
@@ -191,28 +165,21 @@ class RosBagExtractor:
                 elif msg['type'] == 'done': progress.update(tid, completed=progress.tasks[tid].total or 1)
 
         with progress:
-            task_ids = {name: progress.add_task("初始化...", name=f"{name:<20}", total=None) for name in self.folder_map.keys()}
+            task_ids = {name: progress.add_task("就绪", name=f"{name:<20}", total=None) for name in self.folder_map.keys()}
             ui_thread = threading.Thread(target=update_ui, daemon=True); ui_thread.start()
 
-            # 使用进程池，注意 max_workers 根据 CPU 核心调整
             with ProcessPoolExecutor(max_workers=6) as executor:
-                futures = [executor.submit(self.process_single_bag, n, tid, progress_queue, task_ids[n], diff_tol, self.original_dir, self.raw_data_dir) for n, tid in self.folder_map.items()]
+                futures = [executor.submit(self.process_single_bag, n, tid, progress_queue, task_ids[n], self.original_dir, self.raw_data_dir) for n, tid in self.folder_map.items()]
                 for f in futures: f.result()
 
             progress_queue.put(None); ui_thread.join()
 
 if __name__ == '__main__':
+    # 环境配置
     source_path = "~/DT46_V/install/setup.bash"
-    config_path = "config.yaml"
-    diff_tol = 15_000_000 # 容差设为 15ms，匹配更严格一点
-
-    if Path(config_path).exists():
-        with open(config_path, "r") as f:
-            cfg = yaml.safe_load(f)
-            diff_tol = cfg.get("diff_tol_ns", diff_tol)
 
     if "DT46_V" not in os.environ.get("LD_LIBRARY_PATH", ""):
         source_env(source_path)
         os.execv(sys.executable, ['python3'] + sys.argv)
 
-    RosBagExtractor().extract(diff_tol)
+    RosBagExtractor().extract()

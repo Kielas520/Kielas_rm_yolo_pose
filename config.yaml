@@ -1,3 +1,2 @@
 kielas_rm_model:
   dataset:
-    diff_tol_ns: 1_000_000 # 1ms -> 20_000_000 ns

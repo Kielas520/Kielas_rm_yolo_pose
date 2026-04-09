@@ -1,106 +1,143 @@
 import random
 import cv2
-import matplotlib
-matplotlib.use('Agg')  # 使用非交互式后端
-import matplotlib.pyplot as plt
+import shutil
 from pathlib import Path
 
-def visualize_dataset(root_path: str, data_type: str = "train", if_color = True):
+def visualize_dataset(root_path: str, data_type: str = "train", if_color: bool = True):
     # 1. 初始化路径对象
     root = Path(root_path)
     type_dir = root / data_type
+    
+    # 定义输出文件夹路径
+    output_dir = root / f"{data_type}_visualized_samples"
     
     if not type_dir.exists():
         print(f"错误: 找不到目录 {type_dir}")
         return
 
-    # 2. 动态分析分类文件夹 (文件夹名即为 Class ID)
-    # 过滤出所有子目录
-    class_dirs = sorted([d for d in type_dir.iterdir() if d.is_dir()])
-    num_classes = len(class_dirs)
-    
-    if num_classes == 0:
-        print(f"在 {type_dir} 下未发现分类文件夹")
-        return
+    # 刷新文件夹（清空旧数据）
+    if output_dir.exists():
+        shutil.rmtree(output_dir)
+        print(f"已清理旧的输出文件夹: {output_dir.name}")
 
-    # 3. 创建画布: 行数为类别数，列数为 3 (每个类抽3张)
-    fig, axes = plt.subplots(num_classes, 3, figsize=(15, 4 * num_classes))
+    # 创建新的输出文件夹
+    output_dir.mkdir(parents=True, exist_ok=True)
     
-    # 处理只有一个类别的特殊绘图情况
-    if num_classes == 1:
-        axes = [axes]
+    # 定义日志文件路径
+    log_file_path = output_dir / "sample_log.txt"
 
-    for row, class_dir in enumerate(class_dirs):
+    # 2. 收集所有图片和对应的标签路径
+    all_data = []
+    class_dirs = [d for d in type_dir.iterdir() if d.is_dir()]
+    
+    for class_dir in class_dirs:
         class_id = class_dir.name
         photo_dir = class_dir / "photos"
         label_dir = class_dir / "labels"
         
-        # 获取所有图片并随机抽样
-        all_photos = list(photo_dir.glob("*.jpg"))
-        if not all_photos:
-            print(f"类别 {class_id} 中没有图片")
+        if not photo_dir.exists():
             continue
             
-        selected_photos = random.sample(all_photos, min(len(all_photos), 3))
-        
-        for col in range(3):
-            ax = axes[row][col]
-            if col >= len(selected_photos):
-                ax.axis('off')
-                continue
-                
-            img_path = selected_photos[col]
-            # 寻找同名的 .txt 标签
+        for img_path in photo_dir.glob("*.jpg"):
             label_path = label_dir / img_path.with_suffix('.txt').name
+            all_data.append((img_path, label_path, class_id))
+    
+    if not all_data:
+        print(f"在 {type_dir} 下未发现任何图片")
+        return
+
+    # 3. 抽样 12 张图片
+    sample_size = min(12, len(all_data))
+    sampled_data = random.sample(all_data, sample_size)
+    
+    # 初始化日志内容
+    log_contents = [
+        f"抽样数据分析日志 (共抽样 {sample_size} 张)\n",
+        f"设置: if_color={if_color}\n",
+        "-" * 50 + "\n"
+    ]
+    
+    # 4. 遍历抽样数据进行绘制、记录并保存
+    for img_path, label_path, class_id in sampled_data:
+        img = cv2.imread(str(img_path))
+        if img is None:
+            log_contents.append(f"[{class_id}] {img_path.name}: 读取图片失败\n")
+            continue
             
-            # 读取图片 (OpenCV 不直接支持 Path 对象，需转为 str)
-            img = cv2.imread(str(img_path))
-            if img is None:
-                continue
-            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        log_entry = f"[{class_id}] {img_path.name}: "
+        
+        if not label_path.exists():
+            log_entry += "未找到对应的标签文件\n"
+        else:
+            valid_targets = 0
+            invalid_targets = 0
+            target_issues = []
             
-            # 读取并绘制标签内容
-            if label_path.exists():
-                with label_path.open('r') as f:
-                    for line in f:
-                        # 解析示例数据: 0 501.0 605.0 499.0 560.0 689.0 595.0 685.0 553.0
+            with label_path.open('r') as f:
+                lines = f.readlines()
+                if not lines:
+                    log_entry += "标签文件存在但内容为空\n"
+                else:
+                    for line_idx, line in enumerate(lines):
                         parts = list(map(float, line.split()))
-                        if len(parts) < 9:
-                            continue
-                        if if_color == True:
-                            # 坐标映射
-                            # pts 格式: [左下, 左上, 右下, 右上]
-                            pts = [
-                                (int(parts[1+1]), int(parts[2+1])), # ld
-                                (int(parts[3+1]), int(parts[4+1])), # lu
-                                (int(parts[5+1]), int(parts[6+1])), # rd
-                                (int(parts[7+1]), int(parts[8+1]))  # ru
-                            ]
+                        
+                        # 检查数据完整性并提取坐标
+                        is_valid = False
+                        if if_color:
+                            if len(parts) >= 10:
+                                is_valid = True
+                                pts = [
+                                    (int(parts[2]), int(parts[3])), (int(parts[4]), int(parts[5])), 
+                                    (int(parts[6]), int(parts[7])), (int(parts[8]), int(parts[9]))
+                                ]
+                            else:
+                                target_issues.append(f"目标{line_idx+1}数据不全(仅{len(parts)}个值,预期>=10)")
                         else:
-                            # 坐标映射
-                            # pts 格式: [左下, 左上, 右下, 右上]
-                            pts = [
-                                (int(parts[1]), int(parts[2])), # ld
-                                (int(parts[3]), int(parts[4])), # lu
-                                (int(parts[5]), int(parts[6])), # rd
-                                (int(parts[7]), int(parts[8]))  # ru
-                            ]
+                            if len(parts) >= 9:
+                                is_valid = True
+                                pts = [
+                                    (int(parts[1]), int(parts[2])), (int(parts[3]), int(parts[4])), 
+                                    (int(parts[5]), int(parts[6])), (int(parts[7]), int(parts[8]))
+                                ]
+                            else:
+                                target_issues.append(f"目标{line_idx+1}数据不全(仅{len(parts)}个值,预期>=9)")
                         
-                        # 绘制左灯条 (lu -> ld) 和 右灯条 (ru -> rd)
-                        cv2.line(img, pts[1], pts[0], (0, 255, 0), 2)
-                        cv2.line(img, pts[3], pts[2], (0, 255, 0), 2)
-                        
-                        # 绘制四个顶点
-                        for p in pts:
-                            cv2.circle(img, p, 4, (255, 0, 0), -1)
+                        if is_valid:
+                            valid_targets += 1
+                            # 绘制目标框和坐标点
+                            cv2.line(img, pts[1], pts[0], (0, 255, 0), 2)
+                            cv2.line(img, pts[3], pts[2], (0, 255, 0), 2)
+                            for p in pts:
+                                cv2.circle(img, p, 4, (255, 0, 0), -1)
+                                coord_text = f"({p[0]},{p[1]})"
+                                cv2.putText(img, coord_text, (p[0] + 5, p[1] - 5), 
+                                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1, cv2.LINE_AA)
+                        else:
+                            invalid_targets += 1
+                            
+                    # 汇总当前图像的日志
+                    log_entry += f"正常目标数: {valid_targets}, 异常目标数: {invalid_targets}"
+                    if target_issues:
+                        log_entry += f" | 异常明细: {', '.join(target_issues)}"
+                    log_entry += "\n"
 
-            ax.imshow(img)
-            ax.set_title(f"Class: {class_id} | {img_path.name}", fontsize=10)
-            ax.axis('off')
+        log_contents.append(log_entry)
 
-    plt.tight_layout()
-    plt.savefig("dataset_visualization.png")
-    print("可视化结果已保存至 dataset_visualization.png")
+        # 标注类别信息
+        cv2.putText(img, f"Class: {class_id}", (15, 30), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2, cv2.LINE_AA)
 
-# 调用示例
-visualize_dataset("./data", "raw", True)
+        # 保存处理后的图像
+        out_img_path = output_dir / f"{class_id}_{img_path.name}"
+        cv2.imwrite(str(out_img_path), img)
+
+    # 5. 将日志写入到文本文件
+    with log_file_path.open('w', encoding='utf-8') as log_f:
+        log_f.writelines(log_contents)
+
+    print(f"成功抽样并处理 {sample_size} 张图片。")
+    print(f"结果图片及日志已保存至: {output_dir.absolute()}")
+    print(f"请查看 {log_file_path.name} 获取数据完整性记录。")
+
+# 调用示例 (if_color=True 代表按照含有颜色标志位解析)
+visualize_dataset("./data", "raw", if_color=True)
