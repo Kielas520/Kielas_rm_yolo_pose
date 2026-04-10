@@ -10,8 +10,7 @@ from src.purify import *
 from src.balance import *
 from src.augment import *
 from src.visiualize import *
-from src.split import * # 新增的 split 模块
-
+from src.split import * 
 console = Console()
 
 def load_balance_config(config_path="config.yaml"):
@@ -53,24 +52,23 @@ def run_balance_step():
         num_workers=4
     )
 
-def run_augment_step():
-    console.print(Panel("开始执行 Augment (数据增强)", style="cyan"))
-    config = AugmentConfig.from_yaml("config.yaml")
-    run_augment_pipeline(
-        input_dir="./data/balance", 
-        output_dir="./data/augment", 
-        num_workers=8,
-        cfg=config
-    )
-
 def run_split_step():
     console.print(Panel("开始执行 Split (数据集拆分)", style="cyan"))
     val_ratio = load_split_config()
     split_dataset_pipeline(
-        input_dir="./data/augment", 
+        input_dir="./data/balance", 
         output_dir="./data/datasets", 
         val_ratio=val_ratio,
         num_workers=8
+    )
+
+def run_augment_step():
+    console.print(Panel("开始执行 Augment (数据增强 - 仅针对训练集)", style="cyan"))
+    config = AugmentConfig.from_yaml("config.yaml")
+    run_augment_pipeline(
+        dataset_dir="./data/datasets", 
+        num_workers=8,
+        cfg=config
     )
 
 def run_visualize_step(stage: str, if_flag: list):
@@ -82,7 +80,7 @@ def run_visualize_step(stage: str, if_flag: list):
     )
 
 def run_full_pipeline():
-    """全流程执行：清洗 -> 可视化 -> 均衡 -> 可视化 -> 增强 -> 可视化 -> 拆分 -> 可视化"""
+    """全流程执行：清洗 -> 均衡 -> 拆分 -> 增强 -> 可视化"""
     console.print("\n[bold green]=== 开始全流程数据处理 ===[/bold green]\n")
     
     run_purify_step()
@@ -91,10 +89,13 @@ def run_full_pipeline():
     run_balance_step()
     run_visualize_step("balance", if_flag=[0, 0])
     
-    run_augment_step()
-    run_visualize_step("augment", if_flag=[1, 1])
-
+    # 调整逻辑：先拆分
     run_split_step()
+    
+    # 后对训练集进行增强
+    run_augment_step()
+    
+    # 此时 datasets 包含原始验证集与增强后的训练集
     run_visualize_step("datasets", if_flag=[1, 1])
     
     console.print(Panel("🎉 全流程处理与可视化完成！", border_style="green"))
@@ -105,17 +106,15 @@ def interactive_visualize():
     console.print(" 1. [cyan]raw[/cyan] (原始数据)")
     console.print(" 2. [cyan]purify[/cyan] (清洗后数据)")
     console.print(" 3. [cyan]balance[/cyan] (均衡后数据)")
-    console.print(" 4. [cyan]augment[/cyan] (增强后数据)")
-    console.print(" 5. [cyan]datasets[/cyan] (拆分后最终数据集)")
+    console.print(" 4. [cyan]datasets[/cyan] (最终数据集 - 包含增强后的训练集)")
     
-    sub_choice = Prompt.ask("请输入序号", choices=["1", "2", "3", "4", "5"], default="5")
+    sub_choice = Prompt.ask("请输入序号", choices=["1", "2", "3", "4"], default="4")
     
     mapping = {
         "1": ("raw", [1, 0]),
         "2": ("purify", [1, 0]),
         "3": ("balance", [0, 0]),
-        "4": ("augment", [1, 1]),
-        "5": ("datasets", [1, 1])
+        "4": ("datasets", [1, 1])
     }
     
     stage, flag = mapping[sub_choice]
@@ -128,8 +127,8 @@ def main():
         "  [bold green]1[/bold green]. 执行 [bold]全流程[/bold] (All-in-one)\n"
         "  [bold green]2[/bold green]. 仅执行 [bold]Purify[/bold] (清洗)\n"
         "  [bold green]3[/bold green]. 仅执行 [bold]Balance[/bold] (均衡)\n"
-        "  [bold green]4[/bold green]. 仅执行 [bold]Augment[/bold] (增强)\n"
-        "  [bold green]5[/bold green]. 仅执行 [bold]Split[/bold] (拆分)\n"
+        "  [bold green]4[/bold green]. 仅执行 [bold]Split[/bold] (拆分)\n"
+        "  [bold green]5[/bold green]. 仅执行 [bold]Augment[/bold] (增强训练集)\n"
         "  [bold green]6[/bold green]. 执行 [bold]Visualize[/bold] (可视化特定阶段)\n"
         "  [bold red]0[/bold red]. 退出程序"
     )
@@ -153,10 +152,10 @@ def main():
             run_balance_step()
             
         elif choice == '4':
-            run_augment_step()
+            run_split_step()
             
         elif choice == '5':
-            run_split_step()
+            run_augment_step()
 
         elif choice == '6':
             interactive_visualize()

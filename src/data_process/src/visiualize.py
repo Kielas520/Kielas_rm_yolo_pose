@@ -36,8 +36,13 @@ def visualize_dataset(root_path: str, data_type: str = "train", if_flag: list = 
                 
             for img_path in photo_dir.glob("*.jpg"):
                 label_path = label_dir / img_path.with_suffix('.txt').name
-                # split.py 中文件名为 {class_id}_{stem}.jpg，提取第一部分作为 class_id
-                class_id = img_path.name.split('_')[0]
+                
+                # 兼容 augmented 数据前缀
+                if img_path.name.startswith("aug_"):
+                    class_id = img_path.name.split('_')[1]
+                else:
+                    class_id = img_path.name.split('_')[0]
+                    
                 all_data.append((img_path, label_path, class_id))
     else:
         # 原始结构: data_type/class_id/photos 和 data_type/class_id/labels
@@ -167,7 +172,6 @@ def visualize_dataset(root_path: str, data_type: str = "train", if_flag: list = 
 
         log_contents.append(log_entry)
         
-        # 保存时，如果是 datasets，文件名本身就已经带有前缀了，避免前缀重复
         if data_type == "datasets":
             out_img_path = output_dir / img_path.name
         else:

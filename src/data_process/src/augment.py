@@ -47,10 +47,10 @@ class AugmentConfig:
     perspective_prob: float = 0.3
     perspective_factor: float = 0.08
     
-    # 背景替换 (新增)
-    bg_replace_prob: float = 0.3          # 触发概率
-    bg_dir: str = "./background"          # 背景图文件夹路径
-    bg_radius_factor: float = 1.3         # 约束圆半径放大系数 (1.0表示刚好包住最远角点)
+    # 背景替换
+    bg_replace_prob: float = 0.3          
+    bg_dir: str = "./background"          
+    bg_radius_factor: float = 1.3         
 
     # 遮挡
     occ_prob: float = 0.5
@@ -233,7 +233,7 @@ def process_data(img, labels, cfg: AugmentConfig, bg_paths: list = None):
         if center_x < 0 or center_x >= w or center_y < 0 or center_y >= h:
             lab['vis'] = 0
 
-    # ================= 4. 随机背景替换 (亮度均衡 + 动态 Ksize 版) =================
+    # ================= 4. 随机背景替换 =================
     if aug_labels and bg_paths and random.random() < cfg.bg_replace_prob:
         bg_path = random.choice(bg_paths)
         bg_img = cv2.imread(str(bg_path))
@@ -242,7 +242,6 @@ def process_data(img, labels, cfg: AugmentConfig, bg_paths: list = None):
             bg_img = cv2.resize(bg_img, (w, h))
             mask = np.zeros((h, w), dtype=np.float32)
             
-            # 记录所有目标的半径，用于计算动态 Ksize
             all_radii = []
             
             for lab in aug_labels:
@@ -256,7 +255,6 @@ def process_data(img, labels, cfg: AugmentConfig, bg_paths: list = None):
                     cv2.circle(mask, (int(center[0]), int(center[1])), radius, 1.0, -1)
             
             if all_radii:
-                # --- 1. 亮度均衡逻辑 ---
                 gray_aug = cv2.cvtColor(aug_img, cv2.COLOR_BGR2GRAY).astype(np.float32)
                 roi_pixels = gray_aug[mask > 0.5]
                 
@@ -265,29 +263,22 @@ def process_data(img, labels, cfg: AugmentConfig, bg_paths: list = None):
                     gray_bg = cv2.cvtColor(bg_img, cv2.COLOR_BGR2GRAY).astype(np.float32)
                     bg_mean = np.mean(gray_bg)
                     
-                    # 计算增益并限制在合理区间 [0.5, 1.5]
                     brightness_gain = np.clip(roi_mean / (bg_mean + 1e-6), 0.5, 1.5)
                     bg_img = np.clip(bg_img.astype(np.float32) * brightness_gain, 0, 255).astype(np.uint8)
 
-                # --- 2. 动态 Ksize 逻辑 ---
-                # 取当前图像中所有目标半径的平均值作为基准
                 avg_radius = np.mean(all_radii)
-                # 计算动态 ksize: 比例 0.2, 并确保是奇数
                 dynamic_ksize = int(avg_radius * 0.2)
                 if dynamic_ksize % 2 == 0:
                     dynamic_ksize += 1
-                # 限制最小值为 3，防止不模糊
                 dynamic_ksize = max(3, dynamic_ksize)
 
-                # 应用平滑
                 mask = cv2.GaussianBlur(mask, (dynamic_ksize, dynamic_ksize), 0)
                 
-                # --- 3. 最终融合 ---
                 mask_3d = np.expand_dims(mask, axis=-1)
                 aug_img = (aug_img.astype(np.float32) * mask_3d + 
                            bg_img.astype(np.float32) * (1 - mask_3d)).astype(np.uint8)
 
-    # ================= 5. 随机遮挡 (Cutout) =================
+    # ================= 5. 随机遮挡 =================
     if aug_labels and random.random() < cfg.occ_prob:
         radius = (w * cfg.occ_radius_pct) / 2.0
         occ_boxes = []
@@ -374,48 +365,38 @@ def augment_worker(task_queue: Queue, progress: Progress, task_id, cfg: AugmentC
         progress.advance(task_id)
         task_queue.task_done()
 
-def generate_yaml(output_dir: Path):
-    yaml_path = output_dir / "train.yaml"
-    class_counts = {}
-    for class_dir in output_dir.iterdir():
-        if class_dir.is_dir() and (class_dir / "labels").exists():
-            count = len(list((class_dir / "labels").glob("*.txt")))
-            if count > 0: class_counts[class_dir.name] = count
-
-    if not class_counts: return
-    max_count = max(class_counts.values())
-    class_weights = {cid: max_count / count for cid, count in class_counts.items()}
-    sorted_cids = sorted(class_counts.keys(), key=lambda x: int(x) if x.isdigit() else x)
-
-    content = f"path: {output_dir.absolute()}\ntrain: ./\nval: ./\nnc: {len(class_counts)}\n\nnames:\n"
-    for cid in sorted_cids: content += f"  {cid}: '{cid}'\n"
-    content += "\nweights:\n"
-    for cid in sorted_cids: content += f"  {cid}: {class_weights[cid]:.4f}\n"
-    with open(yaml_path, 'w', encoding='utf-8') as f: f.write(content)
-
-def run_augment_pipeline(input_dir: str, output_dir: str, num_workers: int = 8, cfg: AugmentConfig = None):
+def run_augment_pipeline(dataset_dir: str, num_workers: int = 8, cfg: AugmentConfig = None):
     if cfg is None: cfg = AugmentConfig()
-    in_path, out_path = Path(input_dir), Path(output_dir)
+    base_path = Path(dataset_dir)
+    
+    # 强制定位到拆分后的训练集目录
+    train_images_dir = base_path / "images" / "train"
+    train_labels_dir = base_path / "labels" / "train"
 
-    if not in_path.exists():
-        console.print(f"[bold red]错误：[/bold red]找不到输入目录 {in_path}")
+    if not train_images_dir.exists() or not train_labels_dir.exists():
+        console.print(f"[bold red]错误：[/bold red]找不到训练集目录 {train_images_dir}")
         return
 
     tasks = []
-    with console.status("[bold green]正在扫描原始数据..."):
-        for class_dir in in_path.iterdir():
-            if not class_dir.is_dir(): continue
-            photos_dir, labels_dir = class_dir / "photos", class_dir / "labels"
-            if not photos_dir.exists(): continue
-            for img_file in photos_dir.glob("*.jpg"):
-                label_file = labels_dir / (img_file.stem + ".txt")
-                out_class_dir = out_path / class_dir.name
-                tasks.append((img_file, out_class_dir / "photos" / f"aug_{img_file.name}", 
-                              label_file, out_class_dir / "labels" / f"aug_{label_file.name}"))
+    with console.status("[bold green]正在扫描训练集原始数据..."):
+        for img_file in train_images_dir.glob("*.*"):
+            if img_file.suffix.lower() not in ['.jpg', '.jpeg', '.png']: continue
+            
+            # 过滤掉已经增强过的数据，防止二次运行导致指数级膨胀
+            if img_file.name.startswith("aug_"): continue 
 
-    if not tasks: return
-    if out_path.exists(): shutil.rmtree(out_path)
-    out_path.mkdir(parents=True, exist_ok=True)
+            label_file = train_labels_dir / f"{img_file.stem}.txt"
+            if not label_file.exists(): continue
+            
+            # 构造同级目录下的输出路径
+            out_img_file = train_images_dir / f"aug_{img_file.name}"
+            out_label_file = train_labels_dir / f"aug_{label_file.name}"
+            
+            tasks.append((img_file, out_img_file, label_file, out_label_file))
+
+    if not tasks: 
+        console.print("[yellow]未扫描到需要增强的数据或已全部增强完毕。[/yellow]")
+        return
 
     bg_paths = []
     bg_dir = Path(cfg.bg_dir)
@@ -429,10 +410,10 @@ def run_augment_pipeline(input_dir: str, output_dir: str, num_workers: int = 8, 
         console.print(f"[yellow]未找到背景文件夹 {cfg.bg_dir}，将跳过背景替换增强[/yellow]")
 
     # 打印配置信息
-    table = Table(title="数据增强", header_style="bold cyan")
+    table = Table(title="定向训练集数据增强", header_style="bold cyan")
     table.add_column("模块")
     table.add_column("配置与状态")
-    table.add_row("基础架构", f"输入:{input_dir} | 输出:{output_dir} | 线程:{num_workers}")
+    table.add_row("基础架构", f"目标目录:{train_images_dir} | 线程:{num_workers}")
     table.add_row("光学增强", f"模糊:{cfg.blur_prob} | HSV抖动:{cfg.hsv_prob} | 噪声:{cfg.noise_prob} | 光晕:{cfg.bloom_prob}")
     table.add_row("几何变换", f"平移:{cfg.translate_prob} | 缩放:{cfg.scale_prob} | 翻转:{cfg.flip_prob} | 透视:{cfg.perspective_prob}")
     table.add_row("高级遮挡", f"背景替换:{cfg.bg_replace_prob} (半径倍数:{cfg.bg_radius_factor}) | 随机遮挡:{cfg.occ_prob}")
@@ -443,34 +424,27 @@ def run_augment_pipeline(input_dir: str, output_dir: str, num_workers: int = 8, 
                         TimeRemainingColumn(), console=console)
 
     with progress:
-        main_task = progress.add_task("[magenta]执行增强处理...", total=len(tasks))
+        main_task = progress.add_task("[magenta]执行定向增强处理...", total=len(tasks))
         task_queue = Queue(maxsize=2000)
         
         threads = [threading.Thread(target=augment_worker, args=(task_queue, progress, main_task, cfg, bg_paths), daemon=True) 
                    for _ in range(num_workers)]
         for t in threads: t.start()
 
-        created_dirs = set()
         for t in tasks:
-            if t[1].parent not in created_dirs:
-                t[1].parent.mkdir(parents=True, exist_ok=True)
-                t[3].parent.mkdir(parents=True, exist_ok=True)
-                created_dirs.add(t[1].parent)
             task_queue.put(t)
 
         for _ in range(num_workers): task_queue.put(None)
         for t in threads: t.join()
 
-    generate_yaml(out_path)
-    console.print(Panel(f"✅ 处理完成！总数: {len(tasks)}", border_style="green", title="Success"))
+    console.print(Panel(f"✅ 训练集增强完毕！共生成 {len(tasks)} 张增强样本，验证集保持纯净。", border_style="green", title="Success"))
 
 if __name__ == "__main__":
     config_path = "config.yaml"
     config = AugmentConfig.from_yaml(config_path)
 
     run_augment_pipeline(
-        input_dir="./data/balance", 
-        output_dir="./data/augment", 
+        dataset_dir="./data/datasets", 
         num_workers=8,
         cfg=config
     )
