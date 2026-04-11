@@ -163,10 +163,14 @@ def main():
     loss_cfg = cfg['train']['loss']
     data_cfg = cfg['train']['data']
     post_cfg = cfg['train']['post_process']
+    cache_loader = cfg['train']['cache_loader']
     
     # 获取阈值，如果 yaml 里没写则提供默认值
     conf_thresh = float(post_cfg.get('conf_threshold', 0.5))
     nms_thresh = float(post_cfg.get('nms_iou_threshold', 0.45))
+
+    cache_load = cache_loader.get('load', False)
+    cache_load_device = cache_loader.get('device', 'cpu')
 
     early_stop_cfg = train_cfg.get('early_stopping', {})
     auto_stop_enabled = early_stop_cfg.get('enabled', False)
@@ -195,8 +199,12 @@ def main():
 
     # ==========================================
     # 数据加载器配置：放弃全量预加载，回归动态加载
+    # cache_dev = torch.device('cpu')
     # ==========================================
-    cache_dev = None 
+    if cache_load:
+        cache_dev = torch.device(cache_load_device)
+    else:
+        cache_dev = None 
     
     workers = data_cfg['num_workers'] 
     pin_mem = True if device.type == 'cuda' else False

@@ -9,6 +9,10 @@ kielas_rm_train:
     input_size: [416, 416]
     grid_size: [52, 52]
 
+    cache_loader:
+      load: false
+      device: 'cpu'
+    
     learning_rate:
       base_lr: 0.001
       patience: 3
