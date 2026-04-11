@@ -1,10 +1,11 @@
 import os
+import yaml
 import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from rich.console import Console
 
-# 导入我们之前写好的模块
+# 导入之前写好的模块
 from src.datasets import RMArmorDataset
 from src.model import RMDetector
 from src.loss import RMDetLoss
@@ -59,46 +60,66 @@ def validate(model, dataloader, criterion, device):
 
 def main():
     # -----------------------------------------
-    # 1. 超参数与配置
+    # 0. 解析 YAML 配置
     # -----------------------------------------
-    # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    # 临时修改为强制 CPU：
-    device = torch.device("cpu")
+    config_path = "./config.yaml"
+    if not os.path.exists(config_path):
+        console.print(f"[bold red]错误：未找到配置文件 {config_path}[/bold red]")
+        return
+        
+    with open(config_path, 'r', encoding='utf-8') as f:
+        cfg = yaml.safe_load(f)
+        
+    base_cfg = cfg.get('kielas_rm_train', {})
+    train_cfg = base_cfg.get('train', {})
+    data_cfg = base_cfg.get('train', {}).get('data', {})
+    loss_cfg = base_cfg.get('train', {}).get('loss', {})
+
+    # -----------------------------------------
+    # 1. 超参数设置
+    # -----------------------------------------
+    device_cfg = train_cfg.get('device', 'auto')
+    if device_cfg == 'auto':
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        device = torch.device(device_cfg)
     console.print(f"[bold green]Using device: {device}[/bold green]")
     
-    batch_size = 4
-    epochs = 1
-    learning_rate = 1e-3
-    save_dir = "./weights"
+    batch_size = train_cfg.get('batch_size', 4)
+    epochs = train_cfg.get('epochs', 1)
+    learning_rate = float(train_cfg.get('learning_rate', 1e-3))
+    weight_decay = float(train_cfg.get('weight_decay', 1e-4))
+    
+    save_dir = train_cfg.get('save_dir', "./weights")
     os.makedirs(save_dir, exist_ok=True)
 
     # -----------------------------------------
     # 2. 初始化 Dataset 和 DataLoader
     # -----------------------------------------
-    # 注意：这里的路径需要根据你 split.py 生成的实际路径进行调整
     train_dataset = RMArmorDataset(
-        img_dir="./data/datasets/images/train", 
-        label_dir="./data/datasets/labels/train"
+        img_dir=data_cfg.get('train_img_dir', "./data/datasets/images/train"), 
+        label_dir=data_cfg.get('train_label_dir', "./data/datasets/labels/train")
     )
     val_dataset = RMArmorDataset(
-        img_dir="./data/datasets/images/val", 
-        label_dir="./data/datasets/labels/val"
+        img_dir=data_cfg.get('val_img_dir', "./data/datasets/images/val"), 
+        label_dir=data_cfg.get('val_label_dir', "./data/datasets/labels/val")
     )
     
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4, drop_last=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
+    num_workers = data_cfg.get('num_workers', 4)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, drop_last=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
 
     # -----------------------------------------
     # 3. 初始化 模型、损失函数和优化器
     # -----------------------------------------
     model = RMDetector().to(device)
     
-    # 将 yaml 中的类别权重传入损失函数 (如果需要做分类损失的话)
-    # 此处按你的要求先处理目标检测与关键点联合估计的 Loss
-    criterion = RMDetLoss(lambda_conf=1.0, lambda_box=2.0, lambda_pose=1.0).to(device)
+    lambda_conf = float(loss_cfg.get('lambda_conf', 1.0))
+    lambda_box = float(loss_cfg.get('lambda_box', 2.0))
+    lambda_pose = float(loss_cfg.get('lambda_pose', 1.0))
+    criterion = RMDetLoss(lambda_conf=lambda_conf, lambda_box=lambda_box, lambda_pose=lambda_pose).to(device)
     
-    optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-4)
-    # 可选：学习率调度器
+    optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
     # -----------------------------------------

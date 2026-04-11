@@ -1,4 +1,27 @@
 kielas_rm_train:
+  # --- 训练超参数 ---
+  train:
+    device: "cuda"              # 可选: "auto", "cuda", "cpu"
+    batch_size: 4
+    epochs: 1
+    learning_rate: 0.0001
+    weight_decay: 0.0001
+    save_dir: "./model_res"
+
+    data:
+      # --- 数据集路径与加载配置 ---
+      train_img_dir: "./data/datasets/images/train"
+      train_label_dir: "./data/datasets/labels/train"
+      val_img_dir: "./data/datasets/images/val"
+      val_label_dir: "./data/datasets/labels/val"
+      num_workers: 4
+
+    # --- 损失函数权重 ---
+    loss:
+      lambda_conf: 1.0
+      lambda_box: 2.0
+      lambda_pose: 1.0
+
   dataset:
     balance:
       max_samples_per_class: 1000
@@ -27,7 +50,7 @@ kielas_rm_train:
       perspective_prob: 0.4       # 透视变换(形变)概率
       perspective_factor: 0.10    # 透视形变剧烈程度(0-0.2)
 
-      # --- 背景替换增强 (对应代码中 2.x 的修改) ---
+      # --- 背景替换增强 ---
       bg_replace_prob: 0.3        # 背景替换触发概率
       bg_dir: "./background"      # 背景图片存放文件夹
       bg_radius_factor: 1.5       # 约束圆半径倍数 (1.0 为刚好包围目标)

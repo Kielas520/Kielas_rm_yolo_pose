@@ -215,4 +215,4 @@ ros2_bag/
 
 tmp/
 
-weights/
+model_res/
