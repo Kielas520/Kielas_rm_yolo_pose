@@ -97,20 +97,44 @@ def visualize_predictions(model, dataloader, device, save_dir, prefix, progress,
             img_np = imgs[i].cpu().numpy().transpose(1, 2, 0)
             img_np = np.clip(img_np, 0, 1)
             
-            fig, ax = plt.subplots(1, figsize=(8, 6))
+            # 适当放大画布以容纳文字
+            fig, ax = plt.subplots(1, figsize=(10, 8))
             ax.imshow(img_np)
             
+            # ---------------------------
+            # 绘制真实标签 (GT - 绿色)
+            # ---------------------------
             for det in gt_dets[i]:
                 pts = det[1:].reshape(4, 2)
-                polygon_gt = patches.Polygon(pts, linewidth=2, edgecolor='lime', facecolor='none', closed=True)
-                ax.add_patch(polygon_gt)
                 
+                # 1. 绘制四个角点 (散点)
+                ax.scatter(pts[:, 0], pts[:, 1], color='lime', s=20, zorder=3)
+                
+                # 2. 绘制左右灯条 
+                # 假设点序为: 0:左上, 1:左下, 2:右下, 3:右上
+                ax.plot([pts[0, 0], pts[1, 0]], [pts[0, 1], pts[1, 1]], color='lime', linewidth=2) # 左灯条
+                ax.plot([pts[2, 0], pts[3, 0]], [pts[2, 1], pts[3, 1]], color='lime', linewidth=2) # 右灯条
+                
+                # 3. 添加坐标文本
+                for pt in pts:
+                    ax.text(pt[0] + 5, pt[1], f"({int(pt[0])},{int(pt[1])})", color='lime', fontsize=8)
+            
+            # ---------------------------
+            # 绘制模型预测 (Pred - 红色)
+            # ---------------------------
             for det in pred_dets[i]:
                 pts = det[1:].reshape(4, 2)
                 score = det[0]
-                polygon_pred = patches.Polygon(pts, linewidth=2, edgecolor='red', facecolor='none', closed=True, linestyle='--')
-                ax.add_patch(polygon_pred)
-                ax.text(pts[0,0], pts[0,1]-5, f"{score:.2f}", color='red', fontsize=10, weight='bold')
+                
+                # 1. 绘制四个角点 (散点)
+                ax.scatter(pts[:, 0], pts[:, 1], color='red', s=20, zorder=3)
+                
+                # 2. 绘制左右灯条 (预测框用虚线区分)
+                ax.plot([pts[0, 0], pts[1, 0]], [pts[0, 1], pts[1, 1]], color='red', linewidth=2, linestyle='--')
+                ax.plot([pts[2, 0], pts[3, 0]], [pts[2, 1], pts[3, 1]], color='red', linewidth=2, linestyle='--')
+                
+                # 3. 添加置信度文本
+                ax.text(pts[0, 0], pts[0, 1] - 15, f"Conf: {score:.2f}", color='red', fontsize=12, weight='bold')
             
             plt.title(f"{prefix} Set - Sample {count+1}\nGreen: GT | Red: Pred")
             plt.axis('off')
