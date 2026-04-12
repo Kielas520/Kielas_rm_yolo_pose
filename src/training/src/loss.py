@@ -1,9 +1,32 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torchvision.ops import complete_box_iou_loss
 
+# 新增 Focal Loss 类
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=0.25, gamma=2.0, reduction='mean'):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+
+    def forward(self, inputs, targets):
+        # 计算基础的 BCE (不进行均值化)
+        bce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction='none')
+        # 获取预测概率 (pt)
+        pt = torch.exp(-bce_loss)
+        # 计算 Focal Loss
+        focal_loss = self.alpha * (1 - pt) ** self.gamma * bce_loss
+
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        elif self.reduction == 'sum':
+            return focal_loss.sum()
+        return focal_loss
+
 class RMDetLoss(nn.Module):
-    def __init__(self, lambda_conf=1.0, lambda_box=2.0, lambda_pose=1.0, lambda_cls = 1.0, pos_weight=50.0, grid_size=(10, 10)):
+    def __init__(self, lambda_conf=1.0, lambda_box=2.0, lambda_pose=1.0, lambda_cls = 1.0, alpha=0.85, gamma=2.0, grid_size=(10, 10)):
         """
         联合损失函数模块
         lambda_conf, lambda_box, lambda_pose 分别为各项损失的权重系数
@@ -16,11 +39,8 @@ class RMDetLoss(nn.Module):
         self.lambda_cls = lambda_cls
         self.grid_w, self.grid_h = grid_size
         
-        # 【修复】增加 pos_weight 提升正样本的惩罚权重，避免模型完全偏向预测背景
-        self.bce = nn.BCEWithLogitsLoss(
-            reduction='mean',
-            pos_weight=torch.tensor([pos_weight])
-        )
+        # 将原有的 BCE 替换为 Focal Loss
+        self.focal_loss = FocalLoss(alpha, gamma, reduction='mean')
         
         # 关键点像素偏移使用 Smooth L1 损失，对抗异常点具有较好鲁棒性
         self.smooth_l1 = nn.SmoothL1Loss(reduction='mean')
@@ -65,29 +85,19 @@ class RMDetLoss(nn.Module):
         return torch.stack([x1, y1, x2, y2], dim=-1)
 
     def forward(self, pred, target, target_class):
-        """
-        前向传播计算损失
-        pred:         [Batch, 19, H_grid, W_grid] (1置信度 + 4边框 + 8关键点 + 6分类 = 19通道)
-        target:       [Batch, 13, H_grid, W_grid] (不包含分类)
-        target_class: [Batch,  1, H_grid, W_grid] (真实的类别 ID: 0~5)
-        """
-        # 确保 pos_weight 所在的设备与预测张量一致
-        if self.bce.pos_weight.device != pred.device:
-            self.bce.pos_weight = self.bce.pos_weight.to(pred.device)
-
         # -----------------------------------------
-        # 1. 置信度损失 (全局所有网格均参与计算)
+        # 1. 置信度损失 (使用 Focal Loss)
         # -----------------------------------------
         pred_conf = pred[:, 0, :, :]
         target_conf = target[:, 0, :, :]
-        loss_conf = self.bce(pred_conf, target_conf)
+        # 调用更换后的损失函数
+        loss_conf = self.focal_loss(pred_conf, target_conf)
 
         # -----------------------------------------
-        # 2. 提取正样本 (制作 Mask 掩码)
+        # 以下提取正样本及后续逻辑保持原样
         # -----------------------------------------
         pos_mask = (target_conf == 1.0)
         
-        # 若当前批次输入没有任何目标，直接返回置信度损失
         if not pos_mask.any():
             return loss_conf * self.lambda_conf, {
                 'loss_conf': loss_conf.item(),

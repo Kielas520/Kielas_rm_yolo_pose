@@ -1,9 +1,8 @@
 import yaml
 import torch
 import torch.optim as optim
-from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader
-from torch.optim.lr_scheduler import SequentialLR, LinearLR, CosineAnnealingLR
+from torch.optim.lr_scheduler import CosineAnnealingLR
 import cv2
 # 强制关闭 OpenCV 内部多线程与 OpenCL，防止多进程数据加载时 CPU 和内存跑满
 cv2.setNumThreads(0)
@@ -31,7 +30,7 @@ def plot_history(history, save_path):
     plt.figure(figsize=(10, 6))
     epochs = range(1, len(history['train']) + 1)
     plt.plot(epochs, history['train'], 'b-', label='Train Loss')
-    plt.plot(epochs, history['val'], 'r-', label='Val Loss')
+    plt.plot(epochs, history['val'], 'r-', label='Val Pck')
     plt.title('Training and Validation Loss')
     plt.xlabel('Epochs')
     plt.ylabel('Loss')
@@ -244,6 +243,7 @@ def main():
     data_cfg = cfg['train']['data']
     post_cfg = cfg['train']['post_process']
     cache_loader = cfg['train']['cache_loader']
+    continue_cfg = cfg['train']['continue']
     
     # 获取阈值，如果 yaml 里没写则提供默认值
     conf_thresh = float(post_cfg.get('conf_threshold', 0.5))
@@ -325,13 +325,17 @@ def main():
     )
 
     model = RMDetector().to(device)
-    
+    if continue_cfg['enabled']:
+        # 临时加一行，加载炸毁前的权重接着练（注意路径）
+        model.load_state_dict(torch.load(continue_cfg['path']))
+
     criterion = RMDetLoss(
         loss_cfg['lambda_conf'], 
         loss_cfg['lambda_box'], 
         loss_cfg['lambda_pose'],
         loss_cfg['lambda_cls'],
-        loss_cfg['pos_weight'],
+        loss_cfg['alpha'],
+        loss_cfg['gamma'],
         grid_size=grid_size
     ).to(device)
     
@@ -340,8 +344,6 @@ def main():
     # ==========================================
     lr_cfg = train_cfg['learning_rate']
     base_lr = float(lr_cfg['base_lr'])
-    lr_patience = int(lr_cfg.get('patience', 3))
-    lr_factor = float(lr_cfg.get('factor', 0.5))
 
     optimizer = optim.AdamW(
         model.parameters(), 
@@ -351,13 +353,11 @@ def main():
 
     warmup_epochs = max(1, int(epochs * 0.05))
 
-    # 定义基于 PCK 的调度器 (监控指标越大越好)
-    scheduler = ReduceLROnPlateau(
+    # 使用普通的余弦退火，T_max 为去掉 warmup 后的总训练轮数
+    scheduler = CosineAnnealingLR(
         optimizer,
-        mode='max',          # 这里改为 max，因为 PCK 越高越好
-        factor=lr_factor,    
-        patience=lr_patience,
-        min_lr=1e-6          
+        T_max=epochs - warmup_epochs,          
+        eta_min=1e-6     
     )
 
     best_val_pck = 0.0       # 替换原有的 best_val_loss = float('inf')
@@ -380,14 +380,15 @@ def main():
             # 传入新增的解码参数
             val_loss, val_pck = validate(model, val_loader, criterion, device, epoch, progress, input_size, grid_size, conf_thresh, nms_thresh, pck_cfg)
             
-            # --- 2. 学习率调度逻辑 ---
+            # 3. 学习率调度逻辑修改
             if epoch <= warmup_epochs:
                 current_lr = base_lr * (epoch / warmup_epochs)
                 for param_group in optimizer.param_groups:
                     param_group['lr'] = current_lr
             else:
-                # 改为监控 PCK 指标
-                scheduler.step(val_pck)
+                # 余弦退火不再依赖 val_pck，而是直接根据步数推进
+                # 注意传入的是去掉 warmup 后的相对 epoch
+                scheduler.step(epoch - warmup_epochs)
                 current_lr = optimizer.param_groups[0]['lr']
 
             # --- 3. 记录与打印 ---

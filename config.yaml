@@ -9,18 +9,23 @@ kielas_rm_train:
     input_size: [416, 416]
     grid_size: [52, 52]
 
+    continue:
+      enabled: false
+      path: "./model_res_tmp/best_model.pth"
+
     cache_loader:
       load: false
       device: 'cpu'
     
     learning_rate:
       base_lr: 0.001
-      patience: 3
-      factor: 0.5
 
     # 新增后处理配置块
     post_process:
-      conf_threshold: 0.9
+      # # 置信度阈值（通常是 conf_threshold = 0.5）。
+      # 在前几个 epoch，模型还在“摸黑走路”，它输出的目标置信度可能只有 0.1 或者 0.2。
+      # 既然连 0.5 的及格线都没到，NMS（非极大值抑制）阶段就把所有预测框全过滤掉了，相当于模型交了“白卷”，PCK 自然就是 0。
+      conf_threshold: 0.7 
       nms_iou_threshold: 0.5
 
     data:
@@ -38,7 +43,8 @@ kielas_rm_train:
       lambda_box: 1.5
       lambda_pose: 3.0
       lambda_cls: 2.0   # 新增分类损失的权重
-      pos_weight: 50.0
+      alpha: 0.85
+      gamma: 2.0
     pck:
       target_in_range_dist: 20.0
       max_pixel_threshold: 2.5
