@@ -388,7 +388,7 @@ def main():
             else:
                 # 余弦退火不再依赖 val_pck，而是直接根据步数推进
                 # 注意传入的是去掉 warmup 后的相对 epoch
-                scheduler.step(epoch - warmup_epochs)
+                scheduler.step()
                 current_lr = optimizer.param_groups[0]['lr']
 
             # --- 3. 记录与打印 ---
