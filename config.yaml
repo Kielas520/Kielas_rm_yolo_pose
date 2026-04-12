@@ -1,7 +1,7 @@
 kielas_rm_train:
   # --- 训练超参数 ---
   train:
-    device: "cpu"              # 可选: "auto", "cuda", "cpu"
+    device: "cuda"              # 可选: "auto", "cuda", "cpu"
     batch_size: 32
     epochs: 100
     weight_decay: 0.0005
