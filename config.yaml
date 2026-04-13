@@ -25,8 +25,8 @@ kielas_rm_train:
       # # 置信度阈值（通常是 conf_threshold = 0.5）。
       # 在前几个 epoch，模型还在“摸黑走路”，它输出的目标置信度可能只有 0.1 或者 0.2。
       # 既然连 0.5 的及格线都没到，NMS（非极大值抑制）阶段就把所有预测框全过滤掉了，相当于模型交了“白卷”，PCK 自然就是 0。
-      conf_threshold: 0.7 
-      nms_iou_threshold: 0.5
+      conf_threshold: 0.8 
+      nms_iou_threshold: 0.7
 
     data:
       class_id: [0, 2, 5, 6, 8, 11]
@@ -47,7 +47,7 @@ kielas_rm_train:
       gamma: 2.0
     pck:
       target_in_range_dist: 20.0
-      max_pixel_threshold: 2.5
+      max_pixel_threshold: 5.0 # 根据网格计算比较适合的值，416x416 的图片大小对应 52x52 个网格，每个网格大小为 416/52 = 8，所以最好超过半个网格的大小，设定为 5
     # --- 新增：提前停止机制 ---
     early_stopping:
       enabled: true        # 是否开启自动停止

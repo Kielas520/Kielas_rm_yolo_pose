@@ -124,7 +124,7 @@ def validate(model, dataloader, criterion, device, epoch, progress, input_size, 
         total_loss += loss.item()
         
         # 解码张量以获取实际像素坐标
-        gt_dets = decode_tensor(targets, is_pred=False, conf_threshold=0.9, grid_size=grid_size, img_size=input_size)
+        gt_dets = decode_tensor(targets, is_pred=False, conf_threshold=0.9, nms_iou_threshold=0.99, grid_size=grid_size, img_size=input_size)
         pred_dets = decode_tensor(preds, is_pred=True, conf_threshold=conf_thresh, nms_iou_threshold=nms_thresh, grid_size=grid_size, img_size=input_size)
         
         # 计算 PCK@0.5
