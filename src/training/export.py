@@ -1,0 +1,113 @@
+import yaml
+import torch
+from pathlib import Path
+from rich.console import Console
+from rich.status import Status
+from rich.panel import Panel
+
+from src.model import RMDetector
+
+# 初始化 rich 终端控制台
+console = Console()
+
+def export_onnx(model, dummy_input, output_path: Path, cfg):
+    """导出 ONNX 格式并进行轻量化"""
+    console.print(f"[*] 开始导出 ONNX 模型: [cyan]{output_path}[/cyan]")
+    
+    opset = cfg['onnx'].get('opset', 12)
+    simplify = cfg['onnx'].get('simplify', True)
+    
+    with Status("[bold yellow]正在导出原生 ONNX 模型...", console=console):
+        torch.onnx.export(
+            model, 
+            dummy_input, 
+            str(output_path), 
+            export_params=True,
+            opset_version=opset, 
+            do_constant_folding=True,  # 开启常量折叠
+            input_names=['images'],
+            output_names=['output'],
+            dynamic_axes=None 
+        )
+    
+    if simplify:
+        try:
+            import onnx
+            from onnxsim import simplify as onnx_simplify
+            
+            with Status("[bold yellow]正在执行 ONNX 极致轻量化 (onnxsim)...", console=console):
+                onnx_model = onnx.load(str(output_path))
+                model_simp, check = onnx_simplify(onnx_model)
+                
+                if check:
+                    onnx.save(model_simp, str(output_path))
+                    console.print(f"[+] [bold green]ONNX 轻量化完成[/bold green]，文件已保存至: [cyan]{output_path}[/cyan]")
+                else:
+                    console.print("[-] [bold red]ONNX 轻量化校验失败，保留初始版本。[/bold red]")
+        except ImportError:
+            console.print("[-] [bold red]未检测到 onnx 或 onnxsim 库，跳过极致轻量化步骤。[/bold red]")
+            console.print("    建议执行: [white]pip install onnx onnxsim[/white]")
+    else:
+        console.print(f"[+] [bold green]ONNX 导出完成[/bold green]，文件已保存至: [cyan]{output_path}[/cyan]")
+
+def export_torchscript(model, dummy_input, output_path: Path):
+    """导出 TorchScript 格式"""
+    console.print(f"[*] 开始导出 TorchScript 模型: [cyan]{output_path}[/cyan]")
+    with Status("[bold yellow]正在跟踪生成 TorchScript 模型...", console=console):
+        traced_model = torch.jit.trace(model, dummy_input)
+        traced_model.save(str(output_path))
+    console.print(f"[+] [bold green]TorchScript 导出完成[/bold green]，文件已保存至: [cyan]{output_path}[/cyan]")
+
+def main():
+    config_file = Path("./config.yaml")
+    if not config_file.exists():
+        console.print(f"[bold red]错误：找不到配置文件 {config_file.absolute()}[/bold red]")
+        return
+
+    with open(config_file, 'r', encoding='utf-8') as f:
+        cfg_full = yaml.safe_load(f)
+        
+    if 'kielas_rm_export' not in cfg_full:
+        console.print("[bold red]错误：配置文件中缺少 'kielas_rm_export' 模块。[/bold red]")
+        return
+        
+    cfg = cfg_full['kielas_rm_export']
+    
+    # 使用 pathlib.Path 管理路径
+    weights_path = Path(cfg['weights'])
+    output_dir = Path(cfg['output_dir'])
+    formats = cfg.get('formats', [])
+    input_size = cfg.get('input_size', [416, 416])
+    
+    if not weights_path.exists():
+        console.print(f"[bold red]错误：权重文件不存在 {weights_path.absolute()}[/bold red]")
+        return
+        
+    # 如果输出目录不存在则自动创建
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    console.print("[*] [bold cyan]正在初始化模型并加载权重...[/bold cyan]")
+    device = torch.device('cpu') 
+    model = RMDetector()
+    model.load_state_dict(torch.load(weights_path, map_location=device))
+    
+    # 必须切换到 eval 模式固化 BatchNorm 层
+    model.eval() 
+    
+    dummy_input = torch.randn(1, 3, input_size[1], input_size[0], device=device)
+    model_name = weights_path.stem
+    
+    if "onnx" in formats:
+        onnx_path = output_dir / f"{model_name}.onnx"
+        export_onnx(model, dummy_input, onnx_path, cfg)
+        
+    if "torchscript" in formats:
+        ts_path = output_dir / f"{model_name}.pt"
+        export_torchscript(model, dummy_input, ts_path)
+
+    console.print("\n[bold green]所有导出任务执行完毕！[/bold green]")
+    console.print(Panel(f"模型导出目录: [cyan]{output_dir.absolute()}[/cyan]", title="任务完成"))
+
+if __name__ == "__main__":
+    with torch.no_grad():
+        main()

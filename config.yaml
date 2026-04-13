@@ -106,3 +106,20 @@ kielas_rm_train:
       proxies:
         http: "http://127.0.0.1:7897"
         https: "http://127.0.0.1:7897"
+
+kielas_rm_export:
+  # 权重文件路径
+  weights: "./model_res_300/best_model.pth"
+  # 导出模型存放目录
+  output_dir: "./export_res"
+  # 导出格式列表，支持 "onnx", "torchscript"
+  formats: 
+    - "onnx"
+    - "torchscript"
+  # 模型输入尺寸 [宽, 高]
+  input_size: [416, 416]
+  
+  onnx:
+    opset: 18
+    # 是否开启极致轻量化 (需要安装 onnx 和 onnx-simplifier)
+    simplify: true
