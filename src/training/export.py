@@ -11,23 +11,26 @@ from src.model import RMDetector
 console = Console()
 
 def export_onnx(model, dummy_input, output_path: Path, cfg):
-    """导出 ONNX 格式并进行轻量化"""
+    """导出 ONNX 格式并根据配置进行轻量化"""
     console.print(f"[*] 开始导出 ONNX 模型: [cyan]{output_path}[/cyan]")
     
-    opset = cfg['onnx'].get('opset', 12)
     simplify = cfg['onnx'].get('simplify', True)
+    opset_version = cfg['onnx'].get('opset', 18)
     
-    with Status("[bold yellow]正在导出原生 ONNX 模型...", console=console):
+    with Status("[bold yellow]正在导出原生 ONNX 模型 (Legacy TorchScript 引擎)...", console=console):
+        # 核心修复点：
+        # 1. 传入原始 model，不使用 torch.jit.trace
+        # 2. 显式追加 dynamo=False 参数，强制规避 PyTorch 2.5+ 不稳定的底层引擎
         torch.onnx.export(
-            model, 
-            dummy_input, 
-            str(output_path), 
+            model,
+            dummy_input,
+            str(output_path),
             export_params=True,
-            opset_version=opset, 
-            do_constant_folding=True,  # 开启常量折叠
-            input_names=['images'],
+            opset_version=opset_version,
+            do_constant_folding=True,
+            input_names=['input'],
             output_names=['output'],
-            dynamic_axes=None 
+            dynamo=False
         )
     
     if simplify:
@@ -48,7 +51,7 @@ def export_onnx(model, dummy_input, output_path: Path, cfg):
             console.print("[-] [bold red]未检测到 onnx 或 onnxsim 库，跳过极致轻量化步骤。[/bold red]")
             console.print("    建议执行: [white]pip install onnx onnxsim[/white]")
     else:
-        console.print(f"[+] [bold green]ONNX 导出完成[/bold green]，文件已保存至: [cyan]{output_path}[/cyan]")
+        console.print(f"[+] [bold green]ONNX 导出完成（按配置跳过轻量化）[/bold green]，文件已保存至: [cyan]{output_path}[/cyan]")
 
 def export_torchscript(model, dummy_input, output_path: Path):
     """导出 TorchScript 格式"""
@@ -73,7 +76,6 @@ def main():
         
     cfg = cfg_full['kielas_rm_export']
     
-    # 使用 pathlib.Path 管理路径
     weights_path = Path(cfg['weights'])
     output_dir = Path(cfg['output_dir'])
     formats = cfg.get('formats', [])
@@ -83,7 +85,6 @@ def main():
         console.print(f"[bold red]错误：权重文件不存在 {weights_path.absolute()}[/bold red]")
         return
         
-    # 如果输出目录不存在则自动创建
     output_dir.mkdir(parents=True, exist_ok=True)
     
     console.print("[*] [bold cyan]正在初始化模型并加载权重...[/bold cyan]")
@@ -91,7 +92,6 @@ def main():
     model = RMDetector()
     model.load_state_dict(torch.load(weights_path, map_location=device))
     
-    # 必须切换到 eval 模式固化 BatchNorm 层
     model.eval() 
     
     dummy_input = torch.randn(1, 3, input_size[1], input_size[0], device=device)

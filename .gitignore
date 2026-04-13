@@ -216,3 +216,4 @@ ros2_bag/
 tmp/
 
 model_*/
+exp*/

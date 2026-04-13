@@ -123,3 +123,22 @@ kielas_rm_export:
     opset: 18
     # 是否开启极致轻量化 (需要安装 onnx 和 onnx-simplifier)
     simplify: true
+
+kielas_rm_demo:
+  # 模型类型可选: "pytorch", "onnx", "torchscript"
+  model_type: "onnx" 
+  # 模型权重路径，请确保后缀与 model_type 匹配
+  model_path: "./export_res/best_model.onnx"
+  # 运行设备: "cuda" 或 "cpu"
+  device: "cpu"
+  
+  # 相机索引或视频文件路径 (0为默认摄像头)
+  camera_index: 0
+  
+  # 模型输入与网格尺寸
+  input_size: [416, 416]
+  grid_size: [52, 52]
+  
+  # 后处理阈值
+  conf_threshold: 0.2
+  nms_iou_threshold: 0.2
