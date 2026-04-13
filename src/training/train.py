@@ -342,12 +342,13 @@ def main():
     # ==========================================
     # 提取学习率相关配置
     # ==========================================
-    lr_cfg = train_cfg['learning_rate']
-    base_lr = float(lr_cfg['base_lr'])
-
+    optim_cfg = train_cfg['optimizer']
+    base_lr = float(optim_cfg['base_lr'])
+    betas = optim_cfg['betas']
     optimizer = optim.AdamW(
         model.parameters(), 
         lr=base_lr, 
+        betas=betas, # 一阶矩估计的指数衰减率 将 0.9 改为 0.937
         weight_decay=float(train_cfg['weight_decay'])
     )
 
