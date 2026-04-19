@@ -46,7 +46,7 @@ kielas_rm_train:
   # --- 训练超参数 ---
   train:
     device: "cuda"              # 可选: "auto", "cuda", "cpu"
-    batch_size: 32
+    batch_size: 64
     epochs: 500
     weight_decay: 0.0005
     save_dir: "./model_res"
@@ -62,16 +62,16 @@ kielas_rm_train:
       device: 'cpu'
     
     optimizer:
-      base_lr: 0.001
-      betas: [0.940, 0.999] # 一阶矩估计的指数衰减率 将 0.9 改为 0.940
+      base_lr: 0.002
+      betas: [0.900, 0.999] # 一阶矩估计的指数衰减率 将 0.9 改为 0.940
 
     # 新增后处理配置块
     post_process:
       # # 置信度阈值（通常是 conf_threshold = 0.5）。
       # 在前几个 epoch，模型还在“摸黑走路”，它输出的目标置信度可能只有 0.1 或者 0.2。
       # 既然连 0.5 的及格线都没到，NMS（非极大值抑制）阶段就把所有预测框全过滤掉了，相当于模型交了“白卷”，PCK 自然就是 0。
-      conf_threshold: 0.6 
-      nms_iou_threshold: 0.6
+      conf_threshold: 0.3 
+      nms_iou_threshold: 0.4
 
     data:
       class_id: [0, 2, 5, 6, 8, 11]
@@ -85,9 +85,9 @@ kielas_rm_train:
     # --- 损失函数权重 ---
     loss:
       lambda_conf: 1.0
-      lambda_box: 1.5
-      lambda_pose: 3.0
-      lambda_cls: 2.0   # 新增分类损失的权重
+      lambda_box: 1.0
+      lambda_pose: 2.0
+      lambda_cls: 1.5   # 新增分类损失的权重
       alpha: 0.85
       gamma: 2.0
 
