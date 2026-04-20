@@ -31,7 +31,7 @@ class WorkflowTerminal:
 
         menu_panel = Panel(
             table,
-            title="[bold magenta]RoboMaster 视觉神经网络流水线[/bold magenta]",
+            title="[bold magenta]RoboMaster 视觉神经网络菜单[/bold magenta]",
             subtitle="[gray]Subprocess Execution Mode[/gray]",
             border_style="cyan",
             padding=(1, 2)
