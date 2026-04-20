@@ -11,7 +11,7 @@ cv2.setNumThreads(0)
 cv2.ocl.setUseOpenCL(False) 
 
 from rich.console import Console
-from rich.prompt import Confirm
+from rich.prompt import Confirm, Prompt  # 新增导入 Prompt 用于多选
 from rich.progress import Progress, TextColumn, BarColumn, TaskProgressColumn, TimeRemainingColumn
 import matplotlib
 matplotlib.use('Agg')  # 必须在 import pyplot 之前调用
@@ -345,17 +345,34 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() and train_cfg['device'] == 'auto' else train_cfg['device'])
     save_dir = Path(train_cfg.get('save_dir', "./model_res"))
     
-    # if save_dir.exists() and any(save_dir.iterdir()):
-    #     overwrite = Confirm.ask(f"[bold yellow]输出文件夹 '{save_dir}' 已存在且包含文件，是否清空并刷新？[/bold yellow]")
-    #     if overwrite:
-    #         shutil.rmtree(save_dir)
-    #         save_dir.mkdir(parents=True, exist_ok=True)
-    #         console.print("[green]已清空历史文件夹。[/green]")
-    #     else:
-    #         console.print("[bold red]已取消训练任务以保护现有文件。[/bold red]")
-    #         return
-    # else:
-    #     save_dir.mkdir(parents=True, exist_ok=True)
+    # ---------------- 目录检查与操作询问逻辑修改开始 ----------------
+    if save_dir.exists() and any(save_dir.iterdir()):
+        choice = Prompt.ask(
+            f"\n[bold yellow]输出文件夹 '{save_dir}' 已存在且非空，请选择操作：[/bold yellow]\n"
+            "  [1] 继续训练 (保留文件，从历史权重恢复)\n"
+            "  [2] 清空并刷新 (删除所有文件，重新开始)\n"
+            "  [3] 退出任务",
+            choices=["1", "2", "3"],
+            default="3"
+        )
+        
+        if choice == "2":
+            shutil.rmtree(save_dir)
+            save_dir.mkdir(parents=True, exist_ok=True)
+            console.print("[green]已清空历史文件夹，全新开始训练。[/green]")
+            continue_cfg['enabled'] = False  # 强制不继续
+        elif choice == "3":
+            console.print("[bold red]已取消训练任务。[/bold red]")
+            return
+        else:
+            console.print("[green]选择了继续训练，保留现有文件夹。[/green]")
+            continue_cfg['enabled'] = True
+            # 如果配置中未指定权重路径，默认使用目录下的 last_model.pth
+            if not continue_cfg.get('path'):
+                continue_cfg['path'] = str(save_dir / "last_model.pth")
+    else:
+        save_dir.mkdir(parents=True, exist_ok=True)
+    # ---------------- 目录检查与操作询问逻辑修改结束 ----------------
     
     epochs = train_cfg['epochs']
     
@@ -422,13 +439,18 @@ def main():
     )
 
     model = RMDetector(reg_max=reg_max).to(device)
+    
+    # ---------------- 权重加载逻辑修改开始 ----------------
     if continue_cfg['enabled']:
         weight_path = Path(continue_cfg['path'])
         if weight_path.exists():
             model.load_state_dict(torch.load(weight_path))
             console.print(f"[bold green]成功加载历史权重：{weight_path}，继续训练。[/bold green]")
         else:
-            console.print(f"[bold yellow]警告：未找到指定的权重文件 {weight_path}，将从头开始训练。[/bold yellow]")
+            # 捕获文件为空/不存在的情况，自动回退到重新开始训练
+            console.print(f"[bold yellow]警告：指定的历史权重文件 {weight_path} 不存在（可能是新文件夹或已被清除），将自动从头开始训练。[/bold yellow]")
+            continue_cfg['enabled'] = False
+    # ---------------- 权重加载逻辑修改结束 ----------------
 
     criterion = RMDetLoss(
         loss_cfg['lambda_conf'], 
