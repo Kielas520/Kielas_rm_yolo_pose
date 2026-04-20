@@ -367,7 +367,8 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() and train_cfg['device'] == 'auto' else train_cfg['device'])
     save_dir = Path(train_cfg.get('save_dir', "./model_res"))
-    
+    # 从配置中读取 scale_ranges
+    scale_ranges = data_cfg.get('scale_ranges', [[0, 64], [32, 128], [96, 9999]])
     # ---------------- 目录检查与操作询问逻辑修改开始 ----------------
     if save_dir.exists() and any(save_dir.iterdir()):
         choice = Prompt.ask(
@@ -433,7 +434,8 @@ def main():
             data_cfg['train_label_dir'],
             data_cfg['class_id'],
             input_size=input_size, 
-            strides=strides, 
+            strides=strides,
+            scale_ranges=scale_ranges, # 传入参数 
             cache_device=cache_dev,
             force_no_cache=False,
             data_name = 'train'          
@@ -451,7 +453,8 @@ def main():
             data_cfg['val_label_dir'],
             data_cfg['class_id'],
             input_size=input_size, 
-            strides=strides, 
+            strides=strides,
+            scale_ranges=scale_ranges, # 传入参数 
             cache_device=cache_dev,
             force_no_cache=False,
             data_name = 'val'

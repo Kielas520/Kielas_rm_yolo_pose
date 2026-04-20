@@ -79,14 +79,16 @@ def encode_multi_targets(label_data, img_w=416, img_h=416, grid_w=52, grid_h=52)
 
 class RMArmorDataset(Dataset):
     # 修改了初始化参数，将 grid_size 替换为 strides 列表以支持多尺度
-    def __init__(self, img_dir, label_dir, class_id, input_size=(416, 416), strides=[8, 16, 32], transform=None, cache_device=None, force_no_cache=False, data_name = ''):
+    def __init__(self, img_dir, label_dir, class_id, input_size=(416, 416), strides=[8, 16, 32], scale_ranges=[[0, 64], [32, 128], [96, 9999]], transform=None, cache_device=None, force_no_cache=False, data_name = ''):
         self.img_dir = img_dir
         self.label_dir = label_dir
         self.input_size = input_size
         self.strides = strides
         self.transform = transform
         self.class_id = class_id
-        
+        # 将尺度范围转为张量存储，形状为 (num_strides, 2)
+        # 对应关系：strides[0](8)->scale_ranges[0], strides[1](16)->scale_ranges[1]...
+        self.scale_ranges = torch.tensor(scale_ranges, dtype=torch.float32)
         # 预先计算出多尺度的 grid_size 列表 (宽度网格数, 高度网格数)
         self.grid_sizes = [(input_size[0] // s, input_size[1] // s) for s in strides]
         
@@ -142,50 +144,58 @@ class RMArmorDataset(Dataset):
         label_path = os.path.join(self.label_dir, f"{sample_name}.txt")
         with open(label_path, 'r') as f:
             lines = f.readlines()
-            
+        
         # 定义需要保留的类别 ID 白名单
         keep_classes = set(self.class_id)
 
         for line in lines:
             line = line.strip()
-            if not line:
-                continue
-                
+            if not line: continue
+
             parts = line.split(']')[-1].strip().split() 
             label_data = [float(x) for x in parts]
 
             # 提取类别 ID 和可见性
             class_id = int(label_data[0])
             vis = int(label_data[1])
-            
+
             # 核心拦截逻辑：不在白名单或不可见目标直接当作背景忽略
             if class_id not in keep_classes or vis == 0:
                 continue
-            
-            # 坐标按图像缩放比例进行放缩
-            for i in range(2, len(label_data)):
-                if i % 2 == 0: 
-                    label_data[i] *= scale_x
-                else:          
-                    label_data[i] *= scale_y
 
-            # 遍历每一个尺度，为当前目标编码标签
+            # 缩放坐标
+            for i in range(2, len(label_data)):
+                if i % 2 == 0: label_data[i] *= scale_x
+                else:          label_data[i] *= scale_y
+
+            # 计算目标在当前 416 尺度下的绝对尺寸
+            kpts = np.array(label_data[2:]).reshape(4, 2)
+            x_min, y_min = np.min(kpts, axis=0)
+            x_max, y_max = np.max(kpts, axis=0)
+            box_w, box_h = x_max - x_min, y_max - y_min
+            max_dim = max(box_w, box_h)
+
+            # 遍历每一个尺度
             for scale_idx, (gw, gh) in enumerate(self.grid_sizes):
+                # 获取该层负责的尺寸范围
+                min_s = self.scale_ranges[scale_idx, 0]
+                max_s = self.scale_ranges[scale_idx, 1]
+
+                # 尺度分配判断：如果目标尺寸不在该层范围内，则跳过
+                if not (min_s <= max_dim < max_s):
+                    continue
+
                 targets_info = encode_multi_targets(
                     label_data, 
                     img_w=self.input_size[0], img_h=self.input_size[1], 
                     grid_w=gw, grid_h=gh
                 )
                 
-                # 填充到对应尺度的 Tensor 中
                 for target_vec, cg_x, cg_y, cls_id in targets_info:
                     target_tensors[scale_idx][:, cg_y, cg_x] = target_vec
                     class_tensors[scale_idx][0, cg_y, cg_x] = cls_id
 
-        # 5. 转为 Tensor 并归一化
         img_tensor = torch.from_numpy(img_resized.transpose(2, 0, 1)).float() / 255.0
-        
-        # 将列表中的 numpy 数组统一转为 torch.Tensor
         target_tensors = [torch.from_numpy(t) for t in target_tensors]
         class_tensors = [torch.from_numpy(c) for c in class_tensors]
         

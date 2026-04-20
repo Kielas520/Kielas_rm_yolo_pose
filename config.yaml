@@ -82,13 +82,17 @@ kielas_rm_train:
       val_img_dir: "./data/datasets/images/val"
       val_label_dir: "./data/datasets/labels/val"
       num_workers: 32
-
+      # 对应 stride [8, 16, 32]
+      # Stride 8  负责 0-64 像素 (远)
+      # Stride 16 负责 48-128 像素 (中)
+      # Stride 32 负责 112-9999 像素 (近)
+      scale_ranges: [[0, 23], [20, 90], [87, 416]]
     # --- 损失函数权重 ---
     loss:
-      lambda_conf: 1.0
+      lambda_conf: 2.0
       lambda_box: 2.5
-      lambda_pose: 3.0
-      lambda_cls: 2.0   # 新增分类损失的权重
+      lambda_pose: 5.0
+      lambda_cls: 4.0   # 新增分类损失的权重
       alpha: 0.25
       gamma: 2.0
 
