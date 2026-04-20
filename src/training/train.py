@@ -106,7 +106,7 @@ def calculate_pck(gt_batch, pred_batch, pck_cfg):
     return correct_kpts, total_kpts
 
 @torch.no_grad()
-def validate(model, dataloader, criterion, device, epoch, progress, input_size, grid_size, conf_thresh, nms_thresh, pck_cfg):
+def validate(model, dataloader, criterion, device, epoch, progress, input_size, grid_size, reg_max, conf_thresh, nms_thresh, pck_cfg):
     model.eval()
     total_loss = 0.0
     total_correct = 0
@@ -122,8 +122,8 @@ def validate(model, dataloader, criterion, device, epoch, progress, input_size, 
         total_loss += loss.item()
         
         # 解码张量以获取实际像素坐标
-        gt_dets = decode_tensor(targets, is_pred=False, conf_threshold=0.9, nms_iou_threshold=0.99, grid_size=grid_size, img_size=input_size)
-        pred_dets = decode_tensor(preds, is_pred=True, conf_threshold=conf_thresh, nms_iou_threshold=nms_thresh, grid_size=grid_size, img_size=input_size)
+        gt_dets = decode_tensor(targets, is_pred=False, conf_threshold=0.9, nms_iou_threshold=0.99, grid_size=grid_size, reg_max=reg_max, img_size=input_size)
+        pred_dets = decode_tensor(preds, is_pred=True, conf_threshold=conf_thresh, nms_iou_threshold=nms_thresh, grid_size=grid_size, reg_max=reg_max, img_size=input_size)
         
         # 计算 PCK@0.5
         correct, total = calculate_pck(gt_dets, pred_dets, pck_cfg)
@@ -141,7 +141,7 @@ def validate(model, dataloader, criterion, device, epoch, progress, input_size, 
     return avg_loss, pck_accuracy
 
 @torch.no_grad()
-def visualize_predictions(model, dataloader, device, save_dir, prefix, progress, input_size, grid_size, num_samples=5, conf_threshold=0.5, nms_iou_threshold=0.45):
+def visualize_predictions(model, dataloader, device, save_dir, prefix, progress, input_size, grid_size, reg_max, num_samples=5, conf_threshold=0.5, nms_iou_threshold=0.45):
     model.eval()
     count = 0
     task_id = progress.add_task(f"[yellow]导出 {prefix} 图像...", total=num_samples)
@@ -153,8 +153,8 @@ def visualize_predictions(model, dataloader, device, save_dir, prefix, progress,
         preds = model(imgs) 
         
         # 传入 class_ids 用于真实标签的正确解码
-        gt_dets = decode_tensor(targets, is_pred=False, class_tensor=class_ids, conf_threshold=0.9, grid_size=grid_size, img_size=input_size)
-        pred_dets = decode_tensor(preds, is_pred=True, conf_threshold=conf_threshold, nms_iou_threshold=nms_iou_threshold, grid_size=grid_size, img_size=input_size)
+        gt_dets = decode_tensor(targets, is_pred=False, class_tensor=class_ids, conf_threshold=0.9, grid_size=grid_size, reg_max=reg_max, img_size=input_size)
+        pred_dets = decode_tensor(preds, is_pred=True, conf_threshold=conf_threshold, nms_iou_threshold=nms_iou_threshold, reg_max=reg_max, grid_size=grid_size, img_size=input_size)
         
         for i in range(imgs.size(0)):
             if count >= num_samples:
@@ -274,6 +274,7 @@ def main():
 
     input_size = tuple(train_cfg.get('input_size', [416, 416]))
     grid_size = tuple(train_cfg.get('grid_size', [13, 13]))
+    reg_max = int(train_cfg.get('reg_max', 16)) # <--- 新增：读取 reg_max
 
     # ==========================================
     # 数据加载器配置：放弃全量预加载，回归动态加载
@@ -324,10 +325,14 @@ def main():
         persistent_workers=True if workers > 0 else False
     )
 
-    model = RMDetector().to(device)
+    model = RMDetector(reg_max=reg_max).to(device)
     if continue_cfg['enabled']:
-        # 临时加一行，加载炸毁前的权重接着练（注意路径）
-        model.load_state_dict(torch.load(continue_cfg['path']))
+        weight_path = Path(continue_cfg['path'])
+        if weight_path.exists():
+            model.load_state_dict(torch.load(weight_path))
+            console.print(f"[bold green]成功加载历史权重：{weight_path}，继续训练。[/bold green]")
+        else:
+            console.print(f"[bold yellow]警告：未找到指定的权重文件 {weight_path}，将从头开始训练。[/bold yellow]")
 
     criterion = RMDetLoss(
         loss_cfg['lambda_conf'], 
@@ -336,7 +341,8 @@ def main():
         loss_cfg['lambda_cls'],
         loss_cfg['alpha'],
         loss_cfg['gamma'],
-        grid_size=grid_size
+        grid_size=grid_size,
+        reg_max=reg_max # <--- 修改
     ).to(device)
     
     # ==========================================
@@ -379,7 +385,7 @@ def main():
             # --- 1. 执行训练和验证 ---
             train_loss = train_one_epoch(model, train_loader, optimizer, criterion, device, epoch, progress)
             # 传入新增的解码参数
-            val_loss, val_pck = validate(model, val_loader, criterion, device, epoch, progress, input_size, grid_size, conf_thresh, nms_thresh, pck_cfg)
+            val_loss, val_pck = validate(model, val_loader, criterion, device, epoch, progress, input_size, grid_size, reg_max, conf_thresh, nms_thresh, pck_cfg)
             
             # 3. 学习率调度逻辑修改
             if epoch <= warmup_epochs:
@@ -469,8 +475,8 @@ def main():
             num_workers=0
         )
         
-        visualize_predictions(model, vis_train_loader, device, save_dir, prefix="train", progress=progress, input_size=input_size, grid_size=grid_size, num_samples=5, conf_threshold=conf_thresh, nms_iou_threshold=nms_thresh)
-        visualize_predictions(model, vis_val_loader, device, save_dir, prefix="val", progress=progress, input_size=input_size, grid_size=grid_size, num_samples=5, conf_threshold=conf_thresh, nms_iou_threshold=nms_thresh)
+        visualize_predictions(model, vis_train_loader, device, save_dir, prefix="train", progress=progress, input_size=input_size, grid_size=grid_size, reg_max=reg_max, num_samples=5, conf_threshold=conf_thresh, nms_iou_threshold=nms_thresh)
+        visualize_predictions(model, vis_val_loader, device, save_dir, prefix="val", progress=progress, input_size=input_size, grid_size=grid_size, reg_max=reg_max, num_samples=5, conf_threshold=conf_thresh, nms_iou_threshold=nms_thresh)
 
     console.print(f"\n[bold green]训练与评估完成！所有结果已保存至: {save_dir.absolute()}[/bold green]")
 

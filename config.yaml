@@ -22,7 +22,7 @@ kielas_rm_train:
       
       # --- 几何变换增强 ---
       flip_prob: 0.10             # 水平翻转概率
-      scale_prob: 0.4             # 缩放概率
+      scale_prob: 0.3             # 缩放概率
       scale_range: [0.8, 1.2]
       rotate_prob: 0.3            # 旋转概率
       rotate_range: [-15, 15]
@@ -48,13 +48,14 @@ kielas_rm_train:
     device: "cuda"              # 可选: "auto", "cuda", "cpu"
     batch_size: 64
     epochs: 500
-    weight_decay: 0.0005
+    weight_decay: 0.01        # 正则化惩罚力度 （0.01 - 0.05）
     save_dir: "./model_res"
     input_size: [416, 416]
     grid_size: [52, 52]
+    reg_max: 16                 # <--- 新增：关键点分布偏移网格范围参数 (预测范围)，决定了网络有没有能力**“够得着”**占据大画幅的近距离装甲板角
 
     continue:
-      enabled: false
+      enabled: true
       path: "./model_res/best_model.pth"
 
     cache_loader:
@@ -62,7 +63,7 @@ kielas_rm_train:
       device: 'cpu'
     
     optimizer:
-      base_lr: 0.002
+      base_lr: 0.0002
       betas: [0.940, 0.999] # 一阶矩估计的指数衰减率 将 0.9 改为 0.940
 
     # 新增后处理配置块
@@ -70,8 +71,8 @@ kielas_rm_train:
       # # 置信度阈值（通常是 conf_threshold = 0.5）。
       # 在前几个 epoch，模型还在“摸黑走路”，它输出的目标置信度可能只有 0.1 或者 0.2。
       # 既然连 0.5 的及格线都没到，NMS（非极大值抑制）阶段就把所有预测框全过滤掉了，相当于模型交了“白卷”，PCK 自然就是 0。
-      conf_threshold: 0.3 
-      nms_iou_threshold: 0.4
+      conf_threshold: 0.5 
+      nms_iou_threshold: 0.6
 
     data:
       class_id: [0, 2, 5, 6, 8, 11]
@@ -80,14 +81,14 @@ kielas_rm_train:
       train_label_dir: "./data/datasets/labels/train"
       val_img_dir: "./data/datasets/images/val"
       val_label_dir: "./data/datasets/labels/val"
-      num_workers: 8
+      num_workers: 32
 
     # --- 损失函数权重 ---
     loss:
       lambda_conf: 1.0
-      lambda_box: 1.0
-      lambda_pose: 2.0
-      lambda_cls: 1.5   # 新增分类损失的权重
+      lambda_box: 2.5
+      lambda_pose: 3.0
+      lambda_cls: 2.0   # 新增分类损失的权重
       alpha: 0.25
       gamma: 2.0
 
@@ -98,7 +99,7 @@ kielas_rm_train:
     # --- 新增：提前停止机制 ---
     early_stopping:
       enabled: true        # 是否开启自动停止
-      min_pck: 0.98        # 验证集 pck 高于此值就停止训练
+      min_pck: 0.95        # 验证集 pck 高于此值就停止训练
 
   tools:
     background:

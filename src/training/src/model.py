@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torchvision
 
 class ConvBNReLU(nn.Module):
@@ -13,7 +14,6 @@ class ConvBNReLU(nn.Module):
 
     def forward(self, x):
         return self.relu(self.bn(self.conv(x)))
-
 
 class DepthwiseConvBlock(nn.Module):
     """深度可分离卷积块 (Depthwise Separable Convolution) - 已增加残差连接支持"""
@@ -39,7 +39,6 @@ class DepthwiseConvBlock(nn.Module):
             return x + out
         return out
 
-
 class StackedBlocks(nn.Module):
     """连续堆叠多个 Block，增加网络深度和特征提取容量"""
     def __init__(self, in_channels, out_channels, num_blocks, stride=1):
@@ -54,7 +53,6 @@ class StackedBlocks(nn.Module):
 
     def forward(self, x):
         return self.blocks(x)
-
 
 class SPPF(nn.Module):
     """空间金字塔池化 (快速版)，显著增加感受野"""
@@ -72,26 +70,20 @@ class SPPF(nn.Module):
         y3 = self.m(y2)
         return self.cv2(torch.cat([x, y1, y2, y3], 1))
 
-
-# RMHead 保持不变
 class RMHead(nn.Module):
-    # ... [保持你原来的代码] ...
-    def __init__(self, in_channels=256):
+    def __init__(self, in_channels=256, reg_max=16):
         super().__init__()
-        # 拆分为置信度头和关键点头
-        # 原有的 1个 Conf + 4个 Box，正好是 5 个通道
+        self.reg_max = reg_max
         self.box_head = nn.Conv2d(in_channels, 5, kernel_size=1, stride=1)
-        self.pose_head = nn.Conv2d(in_channels, 8, kernel_size=1, stride=1)
-        self.cls_head = nn.Conv2d(in_channels, 12, kernel_size=1, stride=1) # 12 类
+        self.pose_head = nn.Conv2d(in_channels, 8 * reg_max, kernel_size=1, stride=1)
+        self.cls_head = nn.Conv2d(in_channels, 12, kernel_size=1, stride=1) 
 
     def forward(self, x):
         box_out = self.box_head(x)   
         pose_out = self.pose_head(x)
         cls_out = self.cls_head(x)
-        # 拼接后总通道数为 5 + 8 + 12 = 25
         out = torch.cat([box_out, pose_out, cls_out], dim=1)
         return out
-
 
 class RMBackbone(nn.Module):
     def __init__(self):
@@ -116,7 +108,6 @@ class RMBackbone(nn.Module):
         # 抛出 S2 参与底层几何特征的融合
         return feat_s2, feat_s3, feat_s4, feat_s5
     
-
 class RMNeck(nn.Module):
     """逐级融合特征金字塔 (PANet 架构：融合 S5, S4, S3 以及高分辨率的 S2)"""
     def __init__(self, in_channels_list=[32, 64, 128, 256], out_channels=256):
@@ -154,14 +145,13 @@ class RMNeck(nn.Module):
         out_final = self.final_fuse(torch.cat([f3, f2_down], dim=1))
         return out_final
 
-
 class RMDetector(nn.Module):
-    def __init__(self):
+    def __init__(self, reg_max=16):
         super().__init__()
         self.backbone = RMBackbone()
         # 初始化时明确传入四层的通道数
         self.neck = RMNeck(in_channels_list=[32, 64, 128, 256], out_channels=256)
-        self.head = RMHead(in_channels=256)
+        self.head = RMHead(in_channels=256, reg_max=reg_max)
 
     def forward(self, x):
         feat_s2, feat_s3, feat_s4, feat_s5 = self.backbone(x)
@@ -169,9 +159,7 @@ class RMDetector(nn.Module):
         out = self.head(fused_feat)
         return out
 
-# 新增：核心解码工具函数 (供推断与可视化使用)
-
-def decode_tensor(tensor, is_pred=True, class_tensor=None, conf_threshold=0.5, nms_iou_threshold=0.45, grid_size=(52, 52), img_size=(416, 416)):
+def decode_tensor(tensor, is_pred=True, class_tensor=None, conf_threshold=0.5, nms_iou_threshold=0.45, grid_size=(52, 52), reg_max=16, img_size=(416, 416)):
     batch_size = tensor.shape[0]
     grid_w, grid_h = grid_size
     img_w, img_h = img_size
@@ -182,6 +170,8 @@ def decode_tensor(tensor, is_pred=True, class_tensor=None, conf_threshold=0.5, n
         conf = tensor[:, 0, :, :]
         
     batch_results = []
+    pose_start = 5
+    pose_end = 5 + 8 * reg_max
     
     for b in range(batch_size):
         mask = conf[b] >= conf_threshold
@@ -194,28 +184,33 @@ def decode_tensor(tensor, is_pred=True, class_tensor=None, conf_threshold=0.5, n
         
         # --- 新增：解析 class_id ---
         if is_pred:
-            # 取 13:25 通道计算预测类别
-            cls_logits = tensor[b, 13:25, grid_y, grid_x].T
+            cls_logits = tensor[b, pose_end : pose_end + 12, grid_y, grid_x].T
             classes = torch.argmax(cls_logits, dim=1).float()
         else:
-            # 从外部传入的 class_tensor 获取真实类别
             if class_tensor is not None:
                 classes = class_tensor[b, 0, grid_y, grid_x].float()
             else:
                 classes = torch.zeros_like(scores)
-        # ---------------------------
         
-        raw_pose = tensor[b, 5:13, grid_y, grid_x].T  
-        
-        # === 新增约束：关键点输出激活 ===
         if is_pred:
-            raw_pose = torch.sigmoid(raw_pose) * 6.0 - 3.0
+            # 提取 DFL 分布并还原为偏移坐标
+            raw_pose_dist = tensor[b, pose_start:pose_end, grid_y, grid_x].T 
+            raw_pose_dist = raw_pose_dist.view(-1, 8, reg_max)
             
-        decoded_pose = torch.zeros_like(raw_pose)
+            prob = F.softmax(raw_pose_dist, dim=-1)
+            project = torch.arange(reg_max, dtype=torch.float32, device=tensor.device)
+            continuous_pose = (prob * project).sum(dim=-1)
+            
+            # 平移回实际偏移量
+            decoded_pose_offset = continuous_pose - (reg_max // 2)
+        else:
+            decoded_pose_offset = tensor[b, 5:13, grid_y, grid_x].T
+            
+        decoded_pose = torch.zeros_like(decoded_pose_offset)
         
         for i in range(4): 
-            px_offset = raw_pose[:, i*2]
-            py_offset = raw_pose[:, i*2 + 1]
+            px_offset = decoded_pose_offset[:, i*2]
+            py_offset = decoded_pose_offset[:, i*2 + 1]
             
             px_norm = (px_offset + grid_x) / grid_w
             py_norm = (py_offset + grid_y) / grid_h
@@ -231,10 +226,9 @@ def decode_tensor(tensor, is_pred=True, class_tensor=None, conf_threshold=0.5, n
         keep_idx = torchvision.ops.nms(boxes_for_nms, scores, nms_iou_threshold)
         
         scores = scores[keep_idx]
-        classes = classes[keep_idx] # 同步过滤类别
+        classes = classes[keep_idx] 
         decoded_pose = decoded_pose[keep_idx]
         
-        # 拼合结果: [score, class_id, x1, y1, x2, y2, x3, y3, x4, y4]
         dets = torch.cat([scores.unsqueeze(1), classes.unsqueeze(1), decoded_pose], dim=1)
         batch_results.append(dets.detach().cpu().numpy())
         
@@ -244,15 +238,15 @@ if __name__ == "__main__":
     model = RMBackbone()
     dummy_input = torch.randn(1, 3, 416, 416)
     out2, out3, out4, out5 = model(dummy_input)
-    print(f"Stage 2 Output Shape: {out2.shape}") # 预期: [1, 32, 104, 104]
-    print(f"Stage 3 Output Shape: {out3.shape}") # 预期: [1, 64, 52, 52]
-    print(f"Stage 4 Output Shape: {out4.shape}") # 预期: [1, 128, 26, 26]
-    print(f"Stage 5 Output Shape: {out5.shape}") # 预期: [1, 256, 13, 13]
+    print(f"Stage 2 Output Shape: {out2.shape}") 
+    print(f"Stage 3 Output Shape: {out3.shape}") 
+    print(f"Stage 4 Output Shape: {out4.shape}") 
+    print(f"Stage 5 Output Shape: {out5.shape}") 
     
-    # 实例化完整模型
-    detector = RMDetector()
+    # RMDetector 实例化时默认 reg_max=16
+    detector = RMDetector(reg_max=16)
     output = detector(dummy_input)
     
     print(f"输入形状: {dummy_input.shape}")
     print(f"输出形状: {output.shape}") 
-    # 预期输出形状: torch.Size([1, 25, 52, 52])
+    # 预期输出形状: torch.Size([1, 145, 52, 52])  (5 + 8*16 + 12 = 145)
