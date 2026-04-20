@@ -79,7 +79,7 @@ def encode_multi_targets(label_data, img_w=416, img_h=416, grid_w=52, grid_h=52)
 
 class RMArmorDataset(Dataset):
     # 修改了初始化参数，将 grid_size 替换为 strides 列表以支持多尺度
-    def __init__(self, img_dir, label_dir, class_id, input_size=(416, 416), strides=[8, 16, 32], transform=None, cache_device=None, force_no_cache=False):
+    def __init__(self, img_dir, label_dir, class_id, input_size=(416, 416), strides=[8, 16, 32], transform=None, cache_device=None, force_no_cache=False, data_name = ''):
         self.img_dir = img_dir
         self.label_dir = label_dir
         self.input_size = input_size
@@ -104,7 +104,7 @@ class RMArmorDataset(Dataset):
             self.class_cache = []
             # 修改加载逻辑：只有当 cache_device 不为空且没有强制关闭时才预加载
             if self.cache_device is not None and not self.force_no_cache:
-                console.print(f"正在将数据集全量预加载至 {self.cache_device}...")
+                console.print(f"正在将数据集{data_name}全量预加载至 {self.cache_device}...")
                 # 将每次迭代的计算逻辑提前到初始化阶段
                 for sample_name in track(self.samples, description="Caching dataset"):
                     img_tensor, target_tensors, class_tensors = self._process_sample(sample_name)

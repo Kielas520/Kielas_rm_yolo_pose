@@ -435,7 +435,8 @@ def main():
             input_size=input_size, 
             strides=strides, 
             cache_device=cache_dev,
-            force_no_cache=False          
+            force_no_cache=False,
+            data_name = 'train'          
         ),
         batch_size=train_cfg['batch_size'], 
         shuffle=True, 
@@ -452,7 +453,8 @@ def main():
             input_size=input_size, 
             strides=strides, 
             cache_device=cache_dev,
-            force_no_cache=False
+            force_no_cache=False,
+            data_name = 'val'
         ),
         batch_size=train_cfg['batch_size'], 
         shuffle=False, 
