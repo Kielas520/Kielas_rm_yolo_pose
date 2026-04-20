@@ -113,6 +113,7 @@ def calculate_pck(gt_batch, pred_batch, pck_cfg):
     total_kpts = 0
     target_in_range_dist = pck_cfg['target_in_range_dist']
     threshold = pck_cfg['max_pixel_threshold']
+    
     for gt_dets, pred_dets in zip(gt_batch, pred_batch):
         if len(gt_dets) == 0:
             continue
@@ -122,26 +123,37 @@ def calculate_pck(gt_batch, pred_batch, pck_cfg):
         if len(pred_dets) == 0:
             continue
             
+        # --- 修复：记录已被匹配的预测框索引 ---
+        matched_preds = set()
+            
         for gt in gt_dets:
             gt_pts = gt[2:].reshape(4, 2)
             gt_center = gt_pts.mean(axis=0)
             
             # 根据中心点距离寻找最佳匹配的预测框
-            best_pred = None
+            best_pred_idx = -1
             min_dist = float('inf')
+            best_pred_pts = None
             
-            for pred in pred_dets:
+            for i, pred in enumerate(pred_dets):
+                if i in matched_preds:
+                    continue # 跳过已经被其他 GT 匹配掉的预测框
+                    
                 pred_pts = pred[2:].reshape(4, 2)
                 pred_center = pred_pts.mean(axis=0)
                 dist = np.linalg.norm(gt_center - pred_center)
+                
                 if dist < min_dist:
                     min_dist = dist
-                    best_pred = pred_pts
+                    best_pred_idx = i
+                    best_pred_pts = pred_pts
             
-            # 如果找到了匹配的预测框
-            if min_dist < target_in_range_dist and best_pred is not None:
+            # 如果找到了符合条件的预测框
+            if min_dist < target_in_range_dist and best_pred_idx != -1:
+                matched_preds.add(best_pred_idx) # 标记为已占用
+                
                 # 计算 4 个角点的独立欧氏距离
-                dists = np.linalg.norm(gt_pts - best_pred, axis=1)
+                dists = np.linalg.norm(gt_pts - best_pred_pts, axis=1)
                 # 统计距离小于阈值的点数
                 correct_kpts += np.sum(dists < threshold)
                 
@@ -173,13 +185,24 @@ def process_multi_scale_dets(preds, targets, class_ids, strides, input_size, reg
     
     # 2. 拼接结果并执行跨尺度 NMS
     for b in range(batch_size):
-        # 合并 GT
+        # --- 修复：合并 GT 并执行去重 ---
         if len(gt_dets_batch[b]) > 0:
-            final_gt_dets.append(np.concatenate(gt_dets_batch[b], axis=0))
+            merged_gts = np.concatenate(gt_dets_batch[b], axis=0)
+            
+            # 构建用于 NMS 的 Tensor (赋予相同置信度)
+            gt_scores = torch.ones(merged_gts.shape[0])
+            gt_pts = torch.tensor(merged_gts[:, 2:]).view(-1, 4, 2)
+            gt_min_xy, _ = torch.min(gt_pts, dim=1)
+            gt_max_xy, _ = torch.max(gt_pts, dim=1)
+            gt_boxes = torch.cat([gt_min_xy, gt_max_xy], dim=1)
+            
+            # 对 GT 使用较严格的 NMS 去重
+            keep_gt = torchvision.ops.nms(gt_boxes, gt_scores, 0.3)
+            final_gt_dets.append(merged_gts[keep_gt.numpy()])
         else:
             final_gt_dets.append([])
             
-        # 合并 Pred 并重新应用 NMS
+        # --- 合并 Pred 并重新应用 NMS (保持不变) ---
         if len(pred_dets_batch[b]) > 0:
             merged_preds = np.concatenate(pred_dets_batch[b], axis=0)
             
