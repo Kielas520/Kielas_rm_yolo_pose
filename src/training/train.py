@@ -421,7 +421,7 @@ def main():
     else:
         cache_dev = None
 
-    scaler = torch.amp.GradScaler(device.type) 
+    scaler = torch.amp.GradScaler(device.type) # type: ignore
     
     workers = data_cfg['num_workers'] 
     pin_mem = True if device.type == 'cuda' else False

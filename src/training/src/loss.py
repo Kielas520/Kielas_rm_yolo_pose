@@ -56,7 +56,7 @@ class Integral(nn.Module):
         # x: [N, 8, reg_max]
         prob = F.softmax(x, dim=-1)
         # 期望值计算
-        continuous_val = (prob * self.project).sum(dim=-1)
+        continuous_val = (prob * self.project).sum(dim=-1) # type: ignore
         return continuous_val
 
 class RMDetLoss(nn.Module):
@@ -210,7 +210,7 @@ class RMDetLoss(nn.Module):
         global_num_pos = 0.0
         for i in range(len(targets)):
             global_num_pos += (targets[i][:, 0, :, :] == 1.0).sum().float()
-        global_num_pos = torch.clamp(global_num_pos, min=1.0)
+        global_num_pos = torch.clamp(global_num_pos, min=1.0) # type: ignore
         
         num_scales = len(preds)
         for i in range(num_scales):

@@ -59,7 +59,7 @@ def export_torchscript(model, dummy_input, output_path: Path):
     console.print(f"[*] 开始导出 TorchScript 模型: [cyan]{output_path}[/cyan]")
     with Status("[bold yellow]正在跟踪生成 TorchScript 模型...", console=console):
         traced_model = torch.jit.trace(model, dummy_input)
-        traced_model.save(str(output_path))
+        traced_model.save(str(output_path)) # type: ignore
     console.print(f"[+] [bold green]TorchScript 导出完成[/bold green]，文件已保存至: [cyan]{output_path}[/cyan]")
 
 def main():

@@ -94,8 +94,8 @@ class RMHead(nn.Module):
         # 偏置初始化：让初始预测概率接近 0.01，防止训练初期负样本 Loss 爆炸
         prior_prob = 0.01
         bias_val = -torch.log(torch.tensor((1 - prior_prob) / prior_prob))
-        nn.init.constant_(self.box_pred.bias[0], bias_val)
-        nn.init.constant_(self.cls_pred.bias, bias_val)
+        nn.init.constant_(self.box_pred.bias[0], bias_val) # type: ignore
+        nn.init.constant_(self.cls_pred.bias, bias_val) # type: ignore
 
     def forward(self, x):
         cls_feat = self.cls_convs(x)
