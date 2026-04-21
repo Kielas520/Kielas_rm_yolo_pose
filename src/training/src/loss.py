@@ -20,12 +20,14 @@ class WingLoss(nn.Module):
         # 你的架构中需要保持与其他 Loss 一致的 reduction='sum' 逻辑
         return loss.sum()
 
+# 修改 1：FocalLoss
 class FocalLoss(nn.Module):
-    def __init__(self, alpha=0.25, gamma=2.0, reduction='sum'):
+    def __init__(self, alpha=0.25, gamma=2.0, reduction='sum', class_weights=None):
         super().__init__()
         self.alpha = alpha
         self.gamma = gamma
         self.reduction = reduction
+        self.class_weights = class_weights # 新增：接收类别权重
 
     def forward(self, inputs, targets):
         bce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction='none')
@@ -34,6 +36,11 @@ class FocalLoss(nn.Module):
         # 为正负样本正确分配 alpha 和 (1 - alpha)
         alpha_factor = torch.where(targets == 1.0, self.alpha, 1.0 - self.alpha)
         focal_loss = alpha_factor * (1 - pt) ** self.gamma * bce_loss
+
+        # 新增核心逻辑：如果在对应通道上存在权重，施加乘性惩罚
+        if self.class_weights is not None:
+            # 此时 focal_loss 形状为 [B, C, H, W]，class_weights 形状为 [1, C, 1, 1]
+            focal_loss = focal_loss * self.class_weights
 
         if self.reduction == 'mean':
             return focal_loss.mean()
@@ -76,19 +83,26 @@ class Integral(nn.Module):
         continuous_val = (prob * self.project).sum(dim=-1) # type: ignore
         return continuous_val
 
+# 修改 2：RMDetLoss
 class RMDetLoss(nn.Module):
-    def __init__(self, lambda_pose=1.5, lambda_cls=1.0, alpha=0.85, gamma=2.0, reg_max=16, omega=10.0, epsilon=2.0, num_classes=12):
+    def __init__(self, lambda_pose=1.5, lambda_cls=1.0, alpha=0.85, gamma=2.0, reg_max=16, omega=10.0, epsilon=2.0, num_classes=12, class_weights=None):
         super().__init__()
-        # 已彻底移除 lambda_conf 和 lambda_box
         self.lambda_pose = lambda_pose 
         self.lambda_cls = lambda_cls
         self.reg_max = reg_max
         self.num_classes = num_classes
         
-        self.focal_loss = FocalLoss(alpha, gamma, reduction='sum')
+        # 新增逻辑：处理传入的 class_weights 并传递给 FocalLoss
+        if class_weights is not None:
+            # 转换 class_weights 的形状以匹配预测输出 [B, C, H, W]
+            cw_tensor = class_weights.view(1, -1, 1, 1)
+        else:
+            cw_tensor = None
+
+        self.focal_loss = FocalLoss(alpha, gamma, reduction='sum', class_weights=cw_tensor)
         self.dfl = DFL()
         self.integral = Integral(reg_max)
-        self.wing_loss = WingLoss(omega=omega, epsilon=epsilon) 
+        self.wing_loss = WingLoss(omega=omega, epsilon=epsilon)
 
     def compute_single_scale_loss(self, pred, target, target_class, global_num_pos): 
         # pred shape: [B, num_classes + 8*reg_max, H, W]

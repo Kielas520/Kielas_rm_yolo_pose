@@ -463,7 +463,34 @@ def main():
             console.print(f"[bold yellow]警告：指定的历史权重文件 {weight_path} 不存在（可能是新文件夹或已被清除），将自动从头开始训练。[/bold yellow]")
             go_on = False
 
-    # 移除了 lambda_conf 和 lambda_box 的传入
+    # ---------------- 新增：解析 dataset.yaml 获取权重 ----------------
+    # 按照 YOLO 数据集规范，基于 train_img_dir 自动定位 dataset.yaml
+    # 假设 data_cfg['train_img_dir'] 为 ".../datasets/images/train"
+    # 向上退两级即可到达 ".../datasets" 目录
+    train_img_path = Path(data_cfg['train_img_dir'])
+    dataset_yaml_path = train_img_path.parent.parent / "dataset.yaml"
+    
+    class_weights_tensor = None
+    
+    if dataset_yaml_path.exists():
+        with open(dataset_yaml_path, 'r', encoding='utf-8') as f:
+            ds_cfg = yaml.safe_load(f)
+            weights_dict = ds_cfg.get('weights', {})
+            if weights_dict:
+                # 模型 num_classes 为 12，构建长度为 12 的默认权重数组
+                num_classes = 12 
+                weights_list = [1.0] * num_classes
+                for cls_idx, weight in weights_dict.items():
+                    if int(cls_idx) < num_classes:
+                        weights_list[int(cls_idx)] = float(weight)
+                
+                # 转换为 Tensor 并移动到对应设备
+                class_weights_tensor = torch.tensor(weights_list, dtype=torch.float32).to(device)
+                console.print(f"[bold green]已从 {dataset_yaml_path.name} 加载多类别权重: {weights_list}[/bold green]")
+    else:
+        console.print(f"[bold yellow]警告：未在 {dataset_yaml_path.parent} 下找到 dataset.yaml，将不使用类别加权。[/bold yellow]")
+    # -------------------------------------------------------------------
+
     criterion = RMDetLoss(
         lambda_pose=loss_cfg.get('lambda_pose', 1.5),
         lambda_cls=loss_cfg.get('lambda_cls', 1.0),
@@ -471,7 +498,8 @@ def main():
         gamma=loss_cfg.get('gamma', 2.0),
         reg_max=reg_max,
         omega=loss_cfg.get('omega', 10.0),
-        epsilon=loss_cfg.get('epsilon', 2.0)
+        epsilon=loss_cfg.get('epsilon', 2.0),
+        class_weights=class_weights_tensor  # 传入自动解析到的权重
     ).to(device)
     
     optim_cfg = train_cfg['optimizer']
