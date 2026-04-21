@@ -52,10 +52,10 @@ kielas_rm_train:
     save_dir: "./model_res"
     input_size: [416, 416]
     strides: [8, 16, 32] # 缩放比例
-    reg_max: 32                 # <--- 新增：关键点分布偏移网格范围参数 (预测范围)，决定了网络有没有能力**“够得着”**占据大画幅的近距离装甲板角
+    reg_max: 16                 # <--- 新增：关键点分布偏移网格范围参数 (预测范围)，决定了网络有没有能力**“够得着”**占据大画幅的近距离装甲板角
 
     continue:
-      enabled: true
+      enabled: false
       path: "./model_res/best_model.pth"
 
     cache_loader:
@@ -81,12 +81,13 @@ kielas_rm_train:
       train_label_dir: "./data/datasets/labels/train"
       val_img_dir: "./data/datasets/images/val"
       val_label_dir: "./data/datasets/labels/val"
-      num_workers: 32
+      num_workers: 0 # 数据搬运到cpu了，你开多线程纯有病
       # 对应 stride [8, 16, 32]
       # Stride 8  负责 0-64 像素 (远)
       # Stride 16 负责 48-128 像素 (中)
       # Stride 32 负责 112-9999 像素 (近)
       scale_ranges: [[0, 23], [20, 90], [87, 416]]
+
     # --- 损失函数权重 ---
     loss:
       lambda_conf: 2.0
@@ -95,15 +96,22 @@ kielas_rm_train:
       lambda_cls: 4.0   # 新增分类损失的权重
       alpha: 0.25
       gamma: 2.0
+      omega: 10.0
+      epsilon: 2.0
 
     pck:
       target_in_range_dist: 20.0
       max_pixel_threshold: 5.0 # 根据网格计算比较适合的值，416x416 的图片大小对应 52x52 个网格，每个网格大小为 416/52 = 8，所以最好超过半个网格的大小，设定为 5
     
+    # 新增：综合评估得分权重配置
+    metric_weights:
+      pck: 0.7        # PCK 占总分的权重
+      id_acc: 0.3     # 类别 ID 准确率占总分的权重
+
     # --- 新增：提前停止机制 ---
     early_stopping:
       enabled: true        # 是否开启自动停止
-      min_pck: 0.98        # 验证集 pck 高于此值就停止训练
+      min_score: 0.98        # 验证集 pck 高于此值就停止训练
 
   tools:
     background:

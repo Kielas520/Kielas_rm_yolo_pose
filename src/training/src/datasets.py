@@ -106,7 +106,7 @@ class RMArmorDataset(Dataset):
             self.class_cache = []
             # 修改加载逻辑：只有当 cache_device 不为空且没有强制关闭时才预加载
             if self.cache_device is not None and not self.force_no_cache:
-                console.print(f"正在将数据集{data_name}全量预加载至 {self.cache_device}...")
+                console.print(f"正在将数据集 {data_name} 全量预加载至 {self.cache_device}...")
                 # 将每次迭代的计算逻辑提前到初始化阶段
                 for sample_name in track(self.samples, description="Caching dataset"):
                     img_tensor, target_tensors, class_tensors = self._process_sample(sample_name)

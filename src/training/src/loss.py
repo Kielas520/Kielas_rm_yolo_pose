@@ -2,6 +2,24 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torchvision.ops import complete_box_iou_loss
+import math
+
+class WingLoss(nn.Module):
+    def __init__(self, omega=10.0, epsilon=2.0):
+        super().__init__()
+        self.omega = omega
+        self.epsilon = epsilon
+        self.C = self.omega - self.omega * math.log(1 + self.omega / self.epsilon)
+
+    def forward(self, pred, target):
+        x = torch.abs(pred - target)
+        loss = torch.where(
+            x < self.omega,
+            self.omega * torch.log(1 + x / self.epsilon),
+            x - self.C
+        )
+        # 你的架构中需要保持与其他 Loss 一致的 reduction='sum' 逻辑
+        return loss.sum()
 
 class FocalLoss(nn.Module):
     def __init__(self, alpha=0.25, gamma=2.0, reduction='sum'):
@@ -60,7 +78,7 @@ class Integral(nn.Module):
         return continuous_val
 
 class RMDetLoss(nn.Module):
-    def __init__(self, lambda_conf=1.0, lambda_box=2.0, lambda_pose=1.5, lambda_cls=1.0, alpha=0.85, gamma=2.0, reg_max=16):
+    def __init__(self, lambda_conf=1.0, lambda_box=2.0, lambda_pose=1.5, lambda_cls=1.0, alpha=0.85, gamma=2.0, reg_max=16, omega=10.0, epsilon=2.0):
         super().__init__()
         self.lambda_conf = lambda_conf
         self.lambda_box = lambda_box
@@ -71,14 +89,18 @@ class RMDetLoss(nn.Module):
         self.focal_loss = FocalLoss(alpha, gamma, reduction='sum')
         self.dfl = DFL()
         self.integral = Integral(reg_max)
-        self.smooth_l1 = nn.SmoothL1Loss(reduction='mean')
+        self.wing_loss = WingLoss(omega=omega, epsilon=epsilon) # 替换了原来的 SmoothL1Loss
 
     def _decode_pred_boxes(self, boxes, grid_y, grid_x, grid_w, grid_h):
+        # 中心点偏移保持不变：[-0.5, 1.5] 的平移范围
         tx = torch.sigmoid(boxes[:, 0]) * 2.0 - 0.5
         ty = torch.sigmoid(boxes[:, 1]) * 2.0 - 0.5
-        w = torch.clamp(torch.sigmoid(boxes[:, 2]), min=1e-6)
-        h = torch.clamp(torch.sigmoid(boxes[:, 3]), min=1e-6)
-         
+        
+        # 【修改点】：将绝对尺寸预测改为相对于当前网格 (感受野) 的相对尺寸
+        # 限制最大缩放倍数为当前网格边长的 4 倍
+        w = (torch.sigmoid(boxes[:, 2]) * 2.0) ** 2 / grid_w
+        h = (torch.sigmoid(boxes[:, 3]) * 2.0) ** 2 / grid_h
+        
         cx = (tx + grid_x) / grid_w
         cy = (ty + grid_y) / grid_h
         
@@ -91,7 +113,8 @@ class RMDetLoss(nn.Module):
 
     def _decode_target_boxes(self, boxes, grid_y, grid_x, grid_w, grid_h):
         tx, ty = boxes[:, 0], boxes[:, 1]
-        w, h = boxes[:, 2], boxes[:, 3]
+        w = torch.clamp(boxes[:, 2], min=1e-5)
+        h = torch.clamp(boxes[:, 3], min=1e-5)
         
         cx = (tx + grid_x) / grid_w
         cy = (ty + grid_y) / grid_h
@@ -138,7 +161,7 @@ class RMDetLoss(nn.Module):
         loss_box_sum = complete_box_iou_loss(pred_boxes, target_boxes, reduction='sum')
         loss_box = loss_box_sum / global_num_pos
 
-        # 3. 关键点损失 (DFL + L1 + OKS)
+        # 3. 关键点损失 (DFL + L1 + OKS + Structural)
         pose_start_idx = 5
         pose_end_idx = 5 + 8 * self.reg_max
         
@@ -155,11 +178,27 @@ class RMDetLoss(nn.Module):
         
         pred_pose_continuous = self.integral(pred_pose_dist) - (self.reg_max // 2)
         
-        # L1 Loss (改为 sum 并全局归一化)
-        smooth_l1_none = nn.SmoothL1Loss(reduction='none')
-        loss_pose_l1_sum = smooth_l1_none(pred_pose_continuous, target_pose).sum()
+        # L1 Loss (改为 sum 并全局归一化) -> 替换为 Wing Loss
+        loss_pose_l1_sum = self.wing_loss(pred_pose_continuous, target_pose)
         loss_pose_l1 = loss_pose_l1_sum / (global_num_pos * 8)
         
+        # --- 新增：装甲板刚体几何先验约束 (Structural Loss) ---
+        pred_pts = pred_pose_continuous.view(-1, 4, 2)
+        target_pts = target_pose.view(-1, 4, 2)
+        
+        # 获取预测对角线中点 (0与2为一条对角线, 1与3为另一条)
+        pred_diag1_mid = (pred_pts[:, 0, :] + pred_pts[:, 2, :]) / 2.0
+        pred_diag2_mid = (pred_pts[:, 1, :] + pred_pts[:, 3, :]) / 2.0
+        
+        # 真实框整体几何中心
+        target_center = target_pts.mean(dim=1)
+        
+        # 惩罚对角线中点与真实中心的距离差异，约束形状不发生严重畸变
+        loss_struct_sum = F.smooth_l1_loss(pred_diag1_mid, target_center, reduction='sum') + \
+                          F.smooth_l1_loss(pred_diag2_mid, target_center, reduction='sum')
+        loss_struct = loss_struct_sum / (global_num_pos * 4)  # 2个中点各2个坐标维度
+        # ----------------------------------------------------
+
         w_norm = target[:, 3, :, :][pos_mask]
         h_norm = target[:, 4, :, :][pos_mask]
         scale = (w_norm * grid_w) * (h_norm * grid_h) + 1e-6
@@ -171,7 +210,8 @@ class RMDetLoss(nn.Module):
         loss_oks_sum = (1.0 - oks).sum()
         loss_oks = loss_oks_sum / global_num_pos
         
-        loss_pose = loss_pose_dfl + loss_pose_l1 + loss_oks * 0.5
+        # 将 Structural Loss 加入总 Pose Loss（给与 0.2 的适中权重，不破坏原有梯度的平稳性）
+        loss_pose = loss_pose_dfl + loss_pose_l1 + loss_oks * 0.5 + loss_struct * 0.2
 
         # 4. 分类损失 (改为 sum 并全局归一化)
         pred_cls = pred[:, pose_end_idx : pose_end_idx + 12, :, :].permute(0, 2, 3, 1)[pos_mask]

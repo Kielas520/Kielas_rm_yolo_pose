@@ -107,10 +107,13 @@ def train_one_epoch(model, dataloader, optimizer, criterion, device, epoch, prog
 
 def calculate_pck(gt_batch, pred_batch, pck_cfg):
     """
-    计算批次数据的 PCK (Percentage of Correct Keypoints)
+    计算批次数据的 PCK 与 类别 ID 准确率
     """
     correct_kpts = 0
     total_kpts = 0
+    correct_ids = 0  # 新增：预测正确的类别数量
+    total_gts = 0    # 新增：GT目标总数
+    
     target_in_range_dist = pck_cfg['target_in_range_dist']
     threshold = pck_cfg['max_pixel_threshold']
     
@@ -119,6 +122,7 @@ def calculate_pck(gt_batch, pred_batch, pck_cfg):
             continue
             
         total_kpts += len(gt_dets) * 4 # 每个装甲板4个点
+        total_gts += len(gt_dets)      # 统计目标个数
         
         if len(pred_dets) == 0:
             continue
@@ -157,7 +161,12 @@ def calculate_pck(gt_batch, pred_batch, pck_cfg):
                 # 统计距离小于阈值的点数
                 correct_kpts += np.sum(dists < threshold)
                 
-    return correct_kpts, total_kpts
+                # --- 新增：如果 ID 匹配正确，累加 correct_ids ---
+                # gt[1] 和 pred_dets[best_pred_idx][1] 分别是真实类别和预测类别
+                if int(gt[1]) == int(pred_dets[best_pred_idx][1]):
+                    correct_ids += 1
+                
+    return correct_kpts, total_kpts, correct_ids, total_gts
 
 def process_multi_scale_dets(preds, targets, class_ids, strides, input_size, reg_max, conf_thresh, nms_thresh):
     """
@@ -224,8 +233,10 @@ def process_multi_scale_dets(preds, targets, class_ids, strides, input_size, reg
 def validate(model, dataloader, criterion, device, epoch, progress, input_size, strides, reg_max, conf_thresh, nms_thresh, pck_cfg):
     model.eval()
     total_loss = 0.0
-    total_correct = 0
+    total_correct_kpts = 0
     total_kpts = 0
+    total_correct_ids = 0 # 新增
+    total_gts = 0         # 新增
     
     task_id = progress.add_task(f"[magenta]Val Epoch {epoch}", total=len(dataloader))
     
@@ -244,19 +255,22 @@ def validate(model, dataloader, criterion, device, epoch, progress, input_size, 
         # 多尺度解码与融合
         gt_dets, pred_dets = process_multi_scale_dets(preds, targets, class_ids, strides, input_size, reg_max, conf_thresh, nms_thresh)
         
-        # 计算 PCK@0.5
-        correct, total = calculate_pck(gt_dets, pred_dets, pck_cfg)
-        total_correct += correct
-        total_kpts += total
+        # 计算 PCK@0.5 与 ID_Acc
+        correct_k, total_k, correct_id, total_gt = calculate_pck(gt_dets, pred_dets, pck_cfg)
+        total_correct_kpts += correct_k
+        total_kpts += total_k
+        total_correct_ids += correct_id
+        total_gts += total_gt
         
         progress.update(task_id, advance=1)
         
     progress.remove_task(task_id)
     
     avg_loss = total_loss / len(dataloader)
-    pck_accuracy = (total_correct / total_kpts) if total_kpts > 0 else 0.0
+    pck_accuracy = (total_correct_kpts / total_kpts) if total_kpts > 0 else 0.0
+    id_accuracy = (total_correct_ids / total_gts) if total_gts > 0 else 0.0
     
-    return avg_loss, pck_accuracy
+    return avg_loss, pck_accuracy, id_accuracy
 
 @torch.no_grad()
 def visualize_predictions(model, dataloader, device, save_dir, prefix, progress, input_size, strides, reg_max, num_samples=5, conf_threshold=0.5, nms_iou_threshold=0.45):
@@ -361,9 +375,14 @@ def main():
     cache_load = cache_loader.get('load', False)
     cache_load_device = cache_loader.get('device', 'cpu')
 
+    # 提取权重和停止阈值配置
+    metric_weights = train_cfg.get('metric_weights', {'pck': 0.6, 'id_acc': 0.4})
+    w_pck = float(metric_weights.get('pck', 0.6))
+    w_id = float(metric_weights.get('id_acc', 0.4))
+
     early_stop_cfg = train_cfg.get('early_stopping', {})
     auto_stop_enabled = early_stop_cfg.get('enabled', False)
-    min_pck = float(early_stop_cfg.get('min_pck', 0.98))
+    min_score = float(early_stop_cfg.get('min_score', 0.98))
 
     device = torch.device("cuda" if torch.cuda.is_available() and train_cfg['device'] == 'auto' else train_cfg['device'])
     save_dir = Path(train_cfg.get('save_dir', "./model_res"))
@@ -400,16 +419,18 @@ def main():
     
     epochs = train_cfg['epochs']
     
-    # 修改了历史记录，新增分项Loss记录
+    # 修改历史字典记录项
     history = {
-        'train_total': [], 
-        'train_conf': [], 
-        'train_box': [], 
-        'train_pose': [], 
-        'train_cls': [], 
-        'val_pck': [], 
-        'lr': []
-    }
+            'train_total': [],
+            'train_conf': [],
+            'train_box': [],
+            'train_pose': [],
+            'train_cls': [],
+            'val_pck': [],
+            'val_id_acc': [],
+            'val_score': [],
+            'lr': []
+        }
 
     input_size = tuple(train_cfg.get('input_size', [416, 416]))
     # 获取多尺度 strides，默认为 [8, 16, 32]
@@ -487,7 +508,9 @@ def main():
         loss_cfg['lambda_cls'],
         loss_cfg['alpha'],
         loss_cfg['gamma'],
-        reg_max=reg_max
+        reg_max,
+        loss_cfg['omega'],
+        loss_cfg['epsilon']
     ).to(device)
     
     optim_cfg = train_cfg['optimizer']
@@ -508,7 +531,7 @@ def main():
         eta_min=1e-6     
     )
 
-    best_val_pck = 0.0      
+    best_val_score = 0.0 # 以前是 best_val_pck      
 
     console.print("[bold green]开始训练...[/bold green]")
     
@@ -526,7 +549,7 @@ def main():
             
             # 接收带有分类/分项Loss的字典
             epoch_losses = train_one_epoch(model, train_loader, optimizer, criterion, device, epoch, progress, scaler)
-            val_loss, val_pck = validate(model, val_loader, criterion, device, epoch, progress, input_size, strides, reg_max, conf_thresh, nms_thresh, pck_cfg)
+            val_loss, val_pck, val_id_acc = validate(model, val_loader, criterion, device, epoch, progress, input_size, strides, reg_max, conf_thresh, nms_thresh, pck_cfg)
             
             if epoch <= warmup_epochs:
                 current_lr = base_lr * (epoch / warmup_epochs)
@@ -536,6 +559,9 @@ def main():
                 scheduler.step()
                 current_lr = optimizer.param_groups[0]['lr']
 
+            # --- 新增：计算综合得分 ---
+            val_score = (w_pck * val_pck) + (w_id * val_id_acc)
+
             # 更新至历史记录字典中
             history['train_total'].append(epoch_losses['total_loss'])
             history['train_conf'].append(epoch_losses['loss_conf'])
@@ -544,19 +570,23 @@ def main():
             history['train_cls'].append(epoch_losses['loss_cls'])
             
             history['val_pck'].append(val_pck)
+            history['val_id_acc'].append(val_id_acc)
+            history['val_score'].append(val_score)
             history['lr'].append(current_lr)
             
-            console.print(f"[bold cyan]Epoch {epoch}/{epochs}[/bold cyan] | LR: {current_lr:.6f} | Train Total: {epoch_losses['total_loss']:.4f} | Pose: {epoch_losses['loss_pose']:.4f} | Val PCK: {val_pck:.4f}")
+            console.print(f"[bold cyan]Epoch {epoch}/{epochs}[/bold cyan] | LR: {current_lr:.6f} | Train Total: {epoch_losses['total_loss']:.4f} | PCK: {val_pck:.4f} | ID Acc: {val_id_acc:.4f} | Score: {val_score:.4f}")
 
-            if val_pck > best_val_pck:
-                best_val_pck = val_pck
+            # 依据综合得分决定是否保存最优模型
+            if val_score > best_val_score:
+                best_val_score = val_score
                 torch.save(model.state_dict(), save_dir / "best_model.pth")
-                console.print(f"[green]  -> 发现更高 PCK: {val_pck:.4f}，模型已保存。[/green]")
+                console.print(f"[green]  -> 发现更高综合得分: {val_score:.4f}，模型已保存。[/green]")
             
             progress.update(epoch_task, advance=1)
             
-            if auto_stop_enabled and val_pck >= min_pck:
-                console.print(f"\n[bold yellow]验证集 PCK ({val_pck:.4f}) 已达到设定的停止阈值，提前终止训练。[/bold yellow]")
+            # 依据综合得分判定是否停止
+            if auto_stop_enabled and val_score >= min_score:
+                console.print(f"\n[bold yellow]验证集综合得分 ({val_score:.4f}) 已达到设定的停止阈值，提前终止训练。[/bold yellow]")
                 break
 
         torch.save(model.state_dict(), save_dir / "last_model.pth")
