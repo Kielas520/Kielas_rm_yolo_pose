@@ -168,18 +168,45 @@ def process_data(img, labels, cfg: AugmentConfig, bg_paths: list = None): # type
         for lab in aug_labels:
             lab['pts'][:, 0] = w - lab['pts'][:, 0]
             old_pts = lab['pts'].copy()
-            # 正确的映射：左边变右边，右边变左边，上下保持不变
             lab['pts'][0] = old_pts[2]  # 新左下 = 旧右下
             lab['pts'][1] = old_pts[3]  # 新左上 = 旧右上
             lab['pts'][2] = old_pts[0]  # 新右下 = 旧左下
             lab['pts'][3] = old_pts[1]  # 新右上 = 旧左上  
 
+    # 【修改】：带裁剪与填充的 Scale，保证面积占比发生真实改变
     if random.random() < cfg.scale_prob:
         scale = random.uniform(*cfg.scale_range)
-        aug_img = cv2.resize(aug_img, None, fx=scale, fy=scale)
+        orig_h, orig_w = aug_img.shape[:2]
+        
+        # 1. 执行缩放
+        scaled_img = cv2.resize(aug_img, None, fx=scale, fy=scale)
+        new_h, new_w = scaled_img.shape[:2]
+        
+        # 2. 准备黑底画布，尺寸严格等于原始图像
+        canvas = np.zeros((orig_h, orig_w, 3), dtype=np.uint8)
+        
+        # 3. 计算放置点和裁剪点
+        start_x = random.randint(0, max(0, orig_w - new_w)) if new_w < orig_w else 0
+        start_y = random.randint(0, max(0, orig_h - new_h)) if new_h < orig_h else 0
+        
+        crop_x = random.randint(0, max(0, new_w - orig_w)) if new_w > orig_w else 0
+        crop_y = random.randint(0, max(0, new_h - orig_h)) if new_h > orig_h else 0
+        
+        copy_w = min(orig_w, new_w)
+        copy_h = min(orig_h, new_h)
+        
+        # 4. 将缩放后的图像安全地放回画布
+        canvas[start_y:start_y+copy_h, start_x:start_x+copy_w] = \
+            scaled_img[crop_y:crop_y+copy_h, crop_x:crop_x+copy_w]
+        aug_img = canvas
+        
+        # 5. 更新所有目标的坐标映射
         for lab in aug_labels:
             lab['pts'] = lab['pts'] * scale
-        h, w = aug_img.shape[:2]
+            lab['pts'][:, 0] = lab['pts'][:, 0] - crop_x + start_x
+            lab['pts'][:, 1] = lab['pts'][:, 1] - crop_y + start_y
+            
+        h, w = aug_img.shape[:2] # 同步更新宽高状态
             
     if random.random() < cfg.rotate_prob:
         angle = random.uniform(*cfg.rotate_range)
@@ -243,19 +270,20 @@ def process_data(img, labels, cfg: AugmentConfig, bg_paths: list = None): # type
             bg_img = cv2.resize(bg_img, (w, h))
             mask = np.zeros((h, w), dtype=np.float32)
             
-            all_radii = []
+            valid_targets = False
             
+            # 【修改】：使用 cv2.fillPoly 精准抠除装甲板，代替原始宽泛的 cv2.circle
             for lab in aug_labels:
                 if lab['vis'] > 0:
-                    pts = lab['pts']
-                    center = np.mean(pts, axis=0)
-                    distances = np.linalg.norm(pts - center, axis=1)
-                    base_radius = np.max(distances)
-                    radius = int(base_radius * cfg.bg_radius_factor)
-                    all_radii.append(radius)
-                    cv2.circle(mask, (int(center[0]), int(center[1])), radius, 1.0, -1)
+                    pts = lab['pts'].astype(np.int32)
+                    cv2.fillPoly(mask, [pts], 1.0)
+                    valid_targets = True
             
-            if all_radii:
+            if valid_targets:
+                # 【新增】：对抠出的多边形做适度膨胀（保留灯条外侧一点点物理辉光），以此阻断对车体的依赖
+                kernel = np.ones((7, 7), np.uint8)
+                mask = cv2.dilate(mask, kernel, iterations=1)
+
                 gray_aug = cv2.cvtColor(aug_img, cv2.COLOR_BGR2GRAY).astype(np.float32)
                 roi_pixels = gray_aug[mask > 0.5]
                 
@@ -267,13 +295,8 @@ def process_data(img, labels, cfg: AugmentConfig, bg_paths: list = None): # type
                     brightness_gain = np.clip(roi_mean / (bg_mean + 1e-6), 0.5, 1.5)
                     bg_img = np.clip(bg_img.astype(np.float32) * brightness_gain, 0, 255).astype(np.uint8)
 
-                avg_radius = np.mean(all_radii)
-                dynamic_ksize = int(avg_radius * 0.2)
-                if dynamic_ksize % 2 == 0:
-                    dynamic_ksize += 1
-                dynamic_ksize = max(3, dynamic_ksize)
-
-                mask = cv2.GaussianBlur(mask, (dynamic_ksize, dynamic_ksize), 0)
+                # 将多边形的硬边缘进行高斯模糊，让融合更加自然
+                mask = cv2.GaussianBlur(mask, (5, 5), 0)
                 
                 mask_3d = np.expand_dims(mask, axis=-1)
                 aug_img = (aug_img.astype(np.float32) * mask_3d + 
@@ -417,7 +440,7 @@ def run_augment_pipeline(dataset_dir: str, num_workers: int = 8, cfg: AugmentCon
     table.add_row("基础架构", f"目标目录:{train_images_dir} | 线程:{num_workers}")
     table.add_row("光学增强", f"模糊:{cfg.blur_prob} | HSV抖动:{cfg.hsv_prob} | 噪声:{cfg.noise_prob} | 光晕:{cfg.bloom_prob}")
     table.add_row("几何变换", f"平移:{cfg.translate_prob} | 缩放:{cfg.scale_prob} | 翻转:{cfg.flip_prob} | 透视:{cfg.perspective_prob}")
-    table.add_row("高级遮挡", f"背景替换:{cfg.bg_replace_prob} (半径倍数:{cfg.bg_radius_factor}) | 随机遮挡:{cfg.occ_prob}")
+    table.add_row("高级遮挡", f"背景替换:{cfg.bg_replace_prob} (精准多边形掩码) | 随机遮挡:{cfg.occ_prob}")
     console.print(table)
 
     progress = Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
