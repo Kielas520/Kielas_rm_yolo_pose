@@ -1,10 +1,12 @@
+from regex import T
 import yaml
 import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader
-from torch.optim.lr_scheduler import CosineAnnealingLR
 import cv2
 import torchvision 
+# 导入
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 
 # 强制关闭 OpenCV 内部多线程与 OpenCL，防止多进程数据加载时 CPU 和内存跑满
 cv2.setNumThreads(0)
@@ -513,11 +515,14 @@ def main():
     )
 
     warmup_epochs = max(1, int(epochs * 0.05))
+    scheduler_cfg = train_cfg['scheduler']
 
-    scheduler = CosineAnnealingLR(
+    # 替换原有的 scheduler
+    scheduler = CosineAnnealingWarmRestarts(
         optimizer,
-        T_max=epochs - warmup_epochs,          
-        eta_min=1e-6     
+        T_0=scheduler_cfg['T_0'],          # 第一次重启在第20个epoch
+        T_mult=scheduler_cfg['T_mult'],        # 后续重启周期翻倍 (20, 40, 80...)
+        eta_min=1e-6
     )
 
     best_val_score = 0.0     

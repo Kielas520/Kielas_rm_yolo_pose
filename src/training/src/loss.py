@@ -117,8 +117,8 @@ class RMDetLoss(nn.Module):
         # 构建 one-hot 格式的分类 target
         target_cls_onehot = torch.zeros_like(pred_cls)
         target_class_long = target_class[:, 0:1, :, :].long()
-        # 将对应类别的通道置为 1.0
-        target_cls_onehot.scatter_(1, target_class_long, 1.0)
+        # 将对应类别的通道置为 1.0 -> 引入标签平滑，改为 0.9
+        target_cls_onehot.scatter_(1, target_class_long, 0.9)
         # 将非正样本的网格全部置为 0.0 (背景)
         target_cls_onehot = target_cls_onehot * pos_mask.unsqueeze(1).float()
         
