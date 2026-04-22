@@ -19,6 +19,7 @@ class AugmentConfig:
     hsv_v_gain: float = 0.8
     noise_prob: float = 0.7
     bloom_prob: float = 0.8
+    bloom_prob_area_range: Tuple[float, float] = (0.01, 0.13)  # 新增：光晕面积占比
 
     # --- 几何变换增强 ---
     flip_prob: float = 0.5
@@ -139,27 +140,63 @@ def process_data(img, labels, cfg, bg_paths: list = None):
         plate_area = max(cv2.contourArea(get_expanded_roi(primary_pts, 1.0, 1.0)), 1.0)
         cx, cy = np.mean(primary_pts, axis=0)
 
-        scale = 1.0
+        # --- 阶段 A：纯形状变换 (旋转 + 透视)，暂不缩放 ---
+        angle = random.uniform(*cfg.rotate_range) if random.random() < cfg.rotate_prob else 0.0
+        
+        T1 = np.array([[1, 0, -cx], [0, 1, -cy], [0, 0, 1]], dtype=np.float32)
+        # 注意这里 scale 固定设为 1.0
+        R_shape = np.vstack([cv2.getRotationMatrix2D((0, 0), angle, 1.0), [0, 0, 1]]).astype(np.float32)
+        T2 = np.array([[1, 0, cx], [0, 1, cy], [0, 0, 1]], dtype=np.float32)
+        
+        M_shape = T2 @ R_shape @ T1
+
+        if random.random() < cfg.perspective_prob:
+            margin = min(h_orig, w_orig) * cfg.perspective_factor
+            pts1 = np.float32([[0, 0], [w_orig, 0], [0, h_orig], [w_orig, h_orig]])
+            pts2 = np.float32([
+                [random.uniform(0, margin), random.uniform(0, margin)],
+                [w_orig - random.uniform(0, margin), random.uniform(0, margin)],
+                [random.uniform(0, margin), h_orig - random.uniform(0, margin)],
+                [w_orig - random.uniform(0, margin), h_orig - random.uniform(0, margin)]
+            ])
+            M_persp = cv2.getPerspectiveTransform(pts1, pts2).astype(np.float32)
+            M_shape = M_persp @ M_shape 
+
+        # --- 阶段 B：面积补偿与目标绝对缩放 (基于画面比例) ---
+        # 计算经过形状变换后，ROI 的新中心点和新面积
+        pts_transformed = cv2.perspectiveTransform(np.array([primary_pts], dtype=np.float32), M_shape)[0]
+        new_area = max(cv2.contourArea(get_expanded_roi(pts_transformed, 1.0, 1.0)), 1.0)
+        new_cx, new_cy = np.mean(pts_transformed, axis=0)
+
+        # 计算补偿比例
         if random.random() < cfg.scale_prob:
+            # 此时 scale_range 代表占据整张图像面积的比例 (例如 0.001 到 0.1)
             target_area_ratio = random.uniform(*cfg.scale_range)
             target_area = w_orig * h_orig * target_area_ratio
-            scale = np.sqrt(target_area / plate_area)
-        
+            # 此公式自动抵消了透视带来的隐式放大/缩小，直达设定的绝对面积
+            final_scale = np.sqrt(target_area / new_area)
+        else:
+            # 即使没有触发缩放增强，也要把透视改变的面积“还原”回原始板子面积
+            final_scale = np.sqrt(plate_area / new_area)
+
+        # --- 阶段 C：平移变换 ---
         tx, ty = 0.0, 0.0
         if random.random() < cfg.translate_prob:
             dt_x, dt_y = cfg.translate_range * w_orig, cfg.translate_range * h_orig
             tx = random.uniform(-dt_x, dt_x)
             ty = random.uniform(-dt_y, dt_y)
-            ncx, ncy = np.clip(cx + tx, w_orig*0.1, w_orig*0.9), np.clip(cy + ty, h_orig*0.1, h_orig*0.9)
-            tx, ty = ncx - cx, ncy - cy
+            # 必须使用形变后的新中心点 (new_cx, new_cy) 计算防出界限制
+            ncx, ncy = np.clip(new_cx + tx, w_orig*0.1, w_orig*0.9), np.clip(new_cy + ty, h_orig*0.1, h_orig*0.9)
+            tx, ty = ncx - new_cx, ncy - new_cy
 
-        angle = random.uniform(*cfg.rotate_range) if random.random() < cfg.rotate_prob else 0.0
+        # --- 阶段 D：组装最终矩阵 ---
+        # 以新中心点 (new_cx, new_cy) 为基准进行缩放，并加上平移
+        T_scale_back = np.array([[1, 0, -new_cx], [0, 1, -new_cy], [0, 0, 1]], dtype=np.float32)
+        S_mat = np.array([[final_scale, 0, 0], [0, final_scale, 0], [0, 0, 1]], dtype=np.float32)
+        T_scale_fwd = np.array([[1, 0, new_cx + tx], [0, 1, new_cy + ty], [0, 0, 1]], dtype=np.float32)
 
-        T1 = np.array([[1, 0, -cx], [0, 1, -cy], [0, 0, 1]], dtype=np.float32)
-        R = np.vstack([cv2.getRotationMatrix2D((0, 0), angle, scale), [0, 0, 1]]).astype(np.float32)
-        T2 = np.array([[1, 0, cx + tx], [0, 1, cy + ty], [0, 0, 1]], dtype=np.float32)
-        
-        M_total = T2 @ R @ T1
+        # 最终矩阵顺序：1. 形状改变 -> 2. 移回原点 -> 3. 施加精准缩放 -> 4. 移回原位并叠加随机平移
+        M_total = (T_scale_fwd @ S_mat @ T_scale_back) @ M_shape
 
         if random.random() < cfg.perspective_prob:
             margin = min(h_orig, w_orig) * cfg.perspective_factor
@@ -249,13 +286,56 @@ def process_data(img, labels, cfg, bg_paths: list = None):
         aug_img = np.clip(aug_img.astype(np.float32) + noise, 0, 255).astype(np.uint8)
 
     if aug_labels and random.random() < cfg.bloom_prob:
-        bloom_layer = np.zeros_like(aug_img, dtype=np.float32)
         for lab in aug_labels:
-            center = np.mean(lab['pts'], axis=0).astype(int)
-            cv2.circle(bloom_layer, tuple(center), int(min(h_orig, w_orig) * 0.05), (255, 255, 255), -1)
-        bloom_layer = cv2.GaussianBlur(bloom_layer, (3, 3), sigmaX=20)
-        aug_img = np.clip(aug_img.astype(np.float32) + bloom_layer * 0.4, 0, 255).astype(np.uint8)
+            pts = lab['pts']
+            
+            # 1. 获取 BBox 边界并在内部随机游走生成光晕中心
+            min_x, min_y = np.min(pts, axis=0)
+            max_x, max_y = np.max(pts, axis=0)
+            
+            cx = int(random.uniform(min_x, max_x))
+            cy = int(random.uniform(min_y, max_y))
 
+            # 2. 根据装甲板面积比例动态计算光晕半径
+            # 使用 cv2.contourArea 获取当前多边形的准确面积，最低限制为 1.0 避免除零
+            plate_area = max(1.0, cv2.contourArea(pts.astype(np.float32)))
+            
+            # 随机取一个面积比例
+            area_ratio = random.uniform(*cfg.bloom_prob_area_range)
+            bloom_area = plate_area * area_ratio
+            
+            # 圆面积公式反推半径
+            radius = int(np.sqrt(bloom_area / np.pi))
+
+            # 如果算出来的半径太小（比如目标本身太远太小），就跳过光晕
+            if radius < 3:
+                continue
+
+            # 3. 生成局部高斯光晕贴图
+            size = radius * 2 + 1
+            x_grid, y_grid = np.meshgrid(np.linspace(-1, 1, size), np.linspace(-1, 1, size))
+            d = np.sqrt(x_grid**2 + y_grid**2)
+
+            sigma = random.uniform(0.15, 0.35)
+            g = np.exp(-(d**2 / (2.0 * sigma**2)))
+            g = np.clip(g, 0, 1)
+
+            color = np.array([random.randint(220, 255), random.randint(220, 255), random.randint(220, 255)], dtype=np.float32)
+            intensity = random.uniform(0.8, 1.5)
+
+            x1, y1 = cx - radius, cy - radius
+            x2, y2 = cx + radius + 1, cy + radius + 1
+
+            ix1, iy1 = max(0, x1), max(0, y1)
+            ix2, iy2 = min(w_orig, x2), min(h_orig, y2)
+
+            if ix1 < ix2 and iy1 < iy2:
+                patch_g = g[iy1-y1:iy2-y1, ix1-x1:ix2-x1]
+                patch_g = np.expand_dims(patch_g, axis=-1)
+                
+                roi = aug_img[iy1:iy2, ix1:ix2].astype(np.float32)
+                roi = np.clip(roi + patch_g * color * intensity, 0, 255)
+                aug_img[iy1:iy2, ix1:ix2] = roi.astype(np.uint8)
     if aug_labels:
         for lab in aug_labels:
             out_count = sum(1 for pt in lab['pts'] if pt[0] < 0 or pt[0] >= w_orig or pt[1] < 0 or pt[1] >= h_orig)
@@ -340,7 +420,7 @@ if __name__ == "__main__":
         if label_path.exists():
             labels = parse_labels_for_test(label_path)
             
-        for v in range(3):
+        for v in range(30):
             aug_img, aug_lbls = process_data(img, labels, cfg, bg_paths)
             viz_img = aug_img.copy()
             for lbl in aug_lbls:

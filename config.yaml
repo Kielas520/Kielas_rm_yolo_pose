@@ -19,13 +19,14 @@ kielas_rm_train:
       hsv_v_gain: 0.8             # 极限明暗反差
       noise_prob: 0.7             # 模拟极暗环境下，工业相机拉高增益产生的满屏高频雪花噪点
       bloom_prob: 0.8             # 强迫网络在严重的 LED 物理光晕中定位灯条真实边界
+      bloom_prob_area_range: [3.0, 4.53] # 光晕相对于板子面积的比例
       
       # --- 几何变换增强 (终极形变模式) ---
       flip_prob: 0.5              # 彻底放开镜像，相当于数据量直接翻倍
       scale_prob: 0.9             # 配合你刚修复的 Scale 逻辑，疯狂折磨多尺度特征金字塔
       roi_h_exp: 2.2
       roi_w_exp: 1.1
-      scale_range: [0.1, 0.2]     # 从芝麻大小(几十像素)到糊脸(占满半个屏幕)，让每个 Stride 的网格都被强制激活
+      scale_range: [0.0009, 0.1]     # 从芝麻大小(几十像素)到糊脸(占满半个屏幕)，让每个 Stride 的网格都被强制激活
       rotate_prob: 0.8            
       rotate_range: [-45, 45]     # 模拟飞坡、翻车、剧烈碰撞以及极端云台俯仰角带来的旋转
       translate_prob: 0.8         
