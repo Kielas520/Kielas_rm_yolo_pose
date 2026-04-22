@@ -4,24 +4,25 @@ import cv2
 import torch
 import numpy as np
 import random
-import hashlib  # <--- 新增导入
+import hashlib  
 from torch.utils.data import Dataset
 from rich.console import Console  
-# 顶部引入 track
 from rich.progress import track
 from pathlib import Path
+
 console = Console()  
 
-# --- 关闭 OpenCV 内部多线程与 OpenCL ---
+# =========================================================
+# 系统级优化：关闭 OpenCV 内部多线程与 OpenCL
 # 防止多进程读取图片时 CPU 直接飙到 100% 并吃满内存
+# =========================================================
 cv2.setNumThreads(0)
 cv2.ocl.setUseOpenCL(False)
-# ---------------------------------------------------------
 
-from src.training.src.augment import process_data 
+# 注意：这里去掉了旧的 from src.training.src.augment import process_data
 
 # ---------------------------------------------------------
-# 1. 目标编码逻辑 
+# 1. 目标编码逻辑 (保持不变)
 # ---------------------------------------------------------
 
 def encode_multi_targets(label_data, img_w=416, img_h=416, grid_w=52, grid_h=52):
@@ -78,13 +79,14 @@ def encode_multi_targets(label_data, img_w=416, img_h=416, grid_w=52, grid_h=52)
     return results
 
 # ---------------------------------------------------------
-# 2. 数据集类 (半在线增强版)
+# 2. 数据集类 (CPU & GPU 解耦管线版)
 # ---------------------------------------------------------
 
 class RMArmorDataset(Dataset):
     def __init__(self, img_dir, label_dir, class_id, input_size=(416, 416), strides=[8, 16, 32], 
                  scale_ranges=[[0, 64], [32, 128], [96, 9999]], transform=None, data_name='', 
-                 augment_cfg=None, bg_dir=None, shared_stage=None, processed_counter=None): # <-- 改为 bg_dir
+                 aug_pipeline=None, bg_dir=None, shared_stage=None, processed_counter=None): 
+        # ▲ 注意：上面将 augment_cfg 替换为了 aug_pipeline
         
         self.img_dir = img_dir
         self.label_dir = label_dir
@@ -99,8 +101,10 @@ class RMArmorDataset(Dataset):
         
         self.samples = [f.split('.')[0] for f in os.listdir(label_dir) if f.endswith('.txt')]
         self.shared_stage = shared_stage
-        self.processed_counter = processed_counter # <-- 接收跨进程计数器
-        self.augment_cfg = augment_cfg
+        self.processed_counter = processed_counter 
+        
+        # 接收外部实例化的数据增强管线对象
+        self.aug_pipeline = aug_pipeline
         
         # 仅保存目录路径，不提前搬运数据
         self.bg_dir = bg_dir
@@ -141,8 +145,6 @@ class RMArmorDataset(Dataset):
         # ================= 2. 半在线随机洗牌机制 & 动态读图 =================
         current_stage = self.shared_stage.value if self.shared_stage is not None else 0
         
-        # 【核心逻辑】如果发生洗牌 (Stage 变化) 或初次加载，Worker 才会去扫描一次背景图文件夹
-        # 这样如果在训练期间向 background 文件夹塞了新图，下次洗牌时也会被自动包含进去
         if self.bg_dir and (self.bg_paths is None or self.current_worker_stage != current_stage):
             bg_path_obj = Path(self.bg_dir)
             self.bg_paths = list(bg_path_obj.glob("*.jpg")) + list(bg_path_obj.glob("*.png")) if bg_path_obj.exists() else []
@@ -155,15 +157,15 @@ class RMArmorDataset(Dataset):
         random.seed(seed)
         np.random.seed(seed)
 
-        # ================= 3. 呼叫增强黑盒 =================
-        if self.augment_cfg is not None:
-            # 直接传入当前 Worker 的 self.bg_paths
-            aug_img, aug_labels = process_data(img, parsed_labels, self.augment_cfg, self.bg_paths)
+        # ================= 3. 呼叫 CPU 端数据增强 (仅几何运算与背景融合) =================
+        if self.aug_pipeline is not None:
+            # 调用管线的 CPU 专用接口
+            aug_img, aug_labels = self.aug_pipeline.process_cpu(img, parsed_labels, self.bg_paths)
         else:
             aug_img, aug_labels = img, parsed_labels
 
         # ================= 4. 色彩空间转换与全局缩放 =================
-        # 所有 OpenCV 色彩、模糊增强做完后，转回 RGB 给模型
+        # 转换为 RGB 后做 resize
         aug_img = cv2.cvtColor(aug_img, cv2.COLOR_BGR2RGB)
         orig_h, orig_w = aug_img.shape[:2]
         
@@ -179,22 +181,18 @@ class RMArmorDataset(Dataset):
             class_tensors.append(np.zeros((1, gh, gw), dtype=np.int64))
 
         for lbl in aug_labels:
-            # 关键拦截：被增强算法判定为不可见，或不在训练白名单内的类别直接丢弃
             if lbl['vis'] == 0 or lbl['class_id'] not in self.keep_classes:
                 continue
                 
-            # 缩放坐标
             scaled_pts = lbl['pts'].copy()
             scaled_pts[:, 0] *= scale_x
             scaled_pts[:, 1] *= scale_y
 
-            # 计算尺寸以分配特征层
             x_min, y_min = np.min(scaled_pts, axis=0)
             x_max, y_max = np.max(scaled_pts, axis=0)
             box_w, box_h = x_max - x_min, y_max - y_min
             max_dim = max(box_w, box_h)
 
-            # 重新组装回 encode_multi_targets 期待的列表格式: [class_id, vis, x1, y1...]
             flat_label_data = [lbl['class_id'], lbl['vis']] + scaled_pts.flatten().tolist()
 
             for scale_idx, (gw, gh) in enumerate(self.grid_sizes):
@@ -214,12 +212,12 @@ class RMArmorDataset(Dataset):
                     target_tensors[scale_idx][:, cg_y, cg_x] = target_vec
                     class_tensors[scale_idx][0, cg_y, cg_x] = cls_id
 
-        # 转换为 Tensor 返回
+        # 转换为 Tensor，供 DataLoader 打包成 Batch
         img_tensor = torch.from_numpy(img_resized.transpose(2, 0, 1)).float() / 255.0
         target_tensors = [torch.from_numpy(t) for t in target_tensors]
         class_tensors = [torch.from_numpy(c) for c in class_tensors]
-        # ================= 在 return 之前新增以下逻辑 =================
-        # 每次 Worker 处理完一张图，跨进程计数器 +1
+        
+        # 每次 Worker 处理完一张图，跨进程计数器 +1 (用于队列状态监控)
         if self.processed_counter is not None:
             with self.processed_counter.get_lock():
                 self.processed_counter.value += 1

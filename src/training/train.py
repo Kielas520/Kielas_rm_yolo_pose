@@ -7,18 +7,17 @@ import torchvision
 import multiprocessing
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 import time
+
 # =========================================================================
 # 【系统级优化】
 # 强制关闭 OpenCV 内部多线程与 OpenCL。
-# 原因：PyTorch 的 DataLoader 多进程 (num_workers > 0) 会和 OpenCV 的内置多线程严重冲突，
-# 导致 CPU 线程数爆炸，资源互相锁死，表现为内存爆满、CPU 100% 但训练极度卡顿。
+# 避免 DataLoader 多进程 (num_workers > 0) 与 OpenCV 冲突导致资源锁死。
 # =========================================================================
 cv2.setNumThreads(0)
 cv2.ocl.setUseOpenCL(False) 
 
 from rich.console import Console
 from rich.prompt import Confirm, Prompt  
-# 引入 rich 进度条的高级组件，包括 SpinnerColumn (转圈动画) 用于指示后台正在增强数据
 from rich.progress import Progress, TextColumn, BarColumn, TaskProgressColumn, TimeRemainingColumn, SpinnerColumn
 import matplotlib
 matplotlib.use('Agg')  
@@ -28,7 +27,7 @@ from pathlib import Path
 import shutil
 import gc
 
-# 导入自定义模块
+# 导入自定义模块 (确保 AugmentPipeline 能够被正确导入)
 from src.training.src import *
 
 console = Console()
@@ -46,37 +45,38 @@ def plot_and_save_curve(data, epochs, title, ylabel, save_path, color='b'):
     plt.close()
 
 def save_training_curves(history, save_dir):
-    """像 YOLO 一样分别保存多种指标曲线，方便直观分析模型收敛情况"""
+    """保存多种指标曲线，方便直观分析模型收敛情况"""
     epochs = range(1, len(history['val_pck']) + 1)
     
-    # 单独保存各项 Loss 和 指标
     plot_and_save_curve(history['train_total'], epochs, 'Total Training Loss', 'Loss', save_dir / "loss_total.png", 'b')
     plot_and_save_curve(history['train_pose'], epochs, 'Pose (Keypoints) Loss', 'Loss', save_dir / "loss_pose.png", 'purple')
     plot_and_save_curve(history['train_cls'], epochs, 'Classification Loss', 'Loss', save_dir / "loss_cls.png", 'brown')
-    
-    # 验证集评估指标 PCK 单独保存
     plot_and_save_curve(history['val_pck'], epochs, 'Validation PCK@0.5', 'PCK', save_dir / "val_pck.png", 'r')
 
-
-# 修改函数签名，接收计数器、batch_size 和数据集总大小
-def train_one_epoch(model, dataloader, optimizer, criterion, device, epoch, progress, scaler, current_stage, processed_counter, batch_size, total_samples):
+# ================= 修改 1：函数签名增加 aug_pipeline 参数 =================
+def train_one_epoch(model, dataloader, optimizer, criterion, device, epoch, progress, scaler, current_stage, processed_counter, batch_size, total_samples, aug_pipeline):
     model.train()
     
     epoch_losses = {'loss_pose': 0.0, 'loss_cls': 0.0, 'total_loss': 0.0}
     task_id = progress.add_task(f"[cyan]Train Epoch {epoch} [bold magenta](Stage {current_stage})[/bold magenta]", total=len(dataloader))
 
-    # 计算理论最大缓存批次 (通常是 workers * prefetch_factor)
     max_cache = (dataloader.num_workers * dataloader.prefetch_factor) if dataloader.num_workers > 0 else 0
 
     fetch_start_time = time.time()
     for batch_idx, (imgs, targets, class_ids) in enumerate(dataloader):
-        # 记录 GPU 等待 CPU 数据花费的时间
         data_time = time.time() - fetch_start_time
         
+        # 1. 基础数据推入显存
         imgs = imgs.to(device)
         targets = [t.to(device) for t in targets]
         class_ids = [c.to(device) for c in class_ids]
         
+        # ================= 修改 2：执行 GPU 级像素增强 =================
+        # 此时 imgs 已经在 GPU 上，调用管线进行色彩、光晕、模糊等极速张量运算
+        if aug_pipeline is not None:
+            imgs = aug_pipeline.process_gpu(imgs)
+        # ============================================================
+
         optimizer.zero_grad()
         
         with torch.autocast(device_type=device.type, dtype=torch.float16):
@@ -92,17 +92,12 @@ def train_one_epoch(model, dataloader, optimizer, criterion, device, epoch, prog
         for k in epoch_losses:
             epoch_losses[k] += loss_dict[k]
             
-        # ================= 队列深度计算 =================
-        # 历史已消耗样本数 + 当前批次已消耗样本数
+        # 队列深度计算
         total_consumed = (epoch - 1) * total_samples + (batch_idx + 1) * batch_size
-        # CPU 实际生产的总样本数
         with processed_counter.get_lock():
             total_produced = processed_counter.value
             
-        # 换算成批次：(生产数 - 消耗数) // batch_size
         cached_batches = max(0, (total_produced - total_consumed) // batch_size)
-        
-        # 颜色告警：如果缓存归 0，说明发生阻塞，标红显示
         cache_color = "red" if cached_batches == 0 else "green"
             
         progress.update(
@@ -116,7 +111,6 @@ def train_one_epoch(model, dataloader, optimizer, criterion, device, epoch, prog
             )
         )
         
-        # 重置时间，开始记录下一个批次的获取耗时
         fetch_start_time = time.time()
         
     progress.remove_task(task_id)
@@ -128,9 +122,7 @@ def train_one_epoch(model, dataloader, optimizer, criterion, device, epoch, prog
     return epoch_losses
 
 def calculate_pck(gt_batch, pred_batch, pck_cfg):
-    """
-    计算批次数据的 PCK 与 类别 ID 准确率
-    """
+    """计算批次数据的 PCK 与 类别 ID 准确率"""
     correct_kpts = 0
     total_kpts = 0
     correct_ids = 0  
@@ -207,7 +199,6 @@ def process_multi_scale_dets(preds, targets, class_ids, strides, input_size, reg
     for b in range(batch_size):
         if len(gt_dets_batch[b]) > 0:
             merged_gts = np.concatenate(gt_dets_batch[b], axis=0)
-            
             gt_scores = torch.ones(merged_gts.shape[0])
             gt_pts = torch.tensor(merged_gts[:, 2:]).view(-1, 4, 2)
             gt_min_xy, _ = torch.min(gt_pts, dim=1)
@@ -221,7 +212,6 @@ def process_multi_scale_dets(preds, targets, class_ids, strides, input_size, reg
             
         if len(pred_dets_batch[b]) > 0:
             merged_preds = np.concatenate(pred_dets_batch[b], axis=0)
-            
             scores = torch.tensor(merged_preds[:, 0])
             pts = torch.tensor(merged_preds[:, 2:]) 
             
@@ -234,7 +224,7 @@ def process_multi_scale_dets(preds, targets, class_ids, strides, input_size, reg
 
 @torch.no_grad()
 def validate(model, dataloader, criterion, device, epoch, progress, input_size, strides, reg_max, conf_thresh, kpt_dist_thresh, pck_cfg):
-    """验证集评估，注意验证集绝对不使用任何在线数据增强，以保证测试基准的绝对公平"""
+    """验证集评估，注意验证集绝对不使用任何在线数据增强"""
     model.eval()
     total_loss = 0.0
     total_correct_kpts = 0
@@ -242,7 +232,6 @@ def validate(model, dataloader, criterion, device, epoch, progress, input_size, 
     total_correct_ids = 0 
     total_gts = 0         
     
-    # ✅ 验证集任务也只使用基本字符串，避免全局字段缺失
     task_id = progress.add_task(f"[magenta]Val Epoch {epoch}", total=len(dataloader))
 
     for imgs, targets, class_ids in dataloader:
@@ -300,49 +289,30 @@ def visualize_predictions(model, dataloader, device, save_dir, prefix, progress,
             fig, ax = plt.subplots(1, figsize=(10, 8))
             ax.imshow(img_np)
             
-            # 画真实框 (GT) - 绿色
             if len(gt_dets[i]) > 0:
                 for det in gt_dets[i]:
                     cls_id = int(det[1])
                     pts = det[2:].reshape(4, 2)
                     cx, cy = np.mean(pts[:, 0]), np.mean(pts[:, 1]) 
-                    
                     ax.scatter(pts[:, 0], pts[:, 1], color='lime', s=20, zorder=3)
                     ax.plot([pts[0, 0], pts[1, 0]], [pts[0, 1], pts[1, 1]], color='lime', linewidth=2)
                     ax.plot([pts[2, 0], pts[3, 0]], [pts[2, 1], pts[3, 1]], color='lime', linewidth=2)
-                    
-                    ax.annotate(f"GT ID: {cls_id}",
-                                xy=(cx, cy), xycoords='data',
-                                xytext=(cx - 60, cy - 40), textcoords='data',
-                                color='lime', weight='bold', fontsize=10,
-                                arrowprops=dict(arrowstyle="-", color='lime', alpha=0.7),
-                                bbox=dict(boxstyle="round,pad=0.2", fc="black", ec="lime", alpha=0.6))
+                    ax.annotate(f"GT ID: {cls_id}", xy=(cx, cy), xytext=(cx - 60, cy - 40), 
+                                color='lime', weight='bold', fontsize=10, bbox=dict(boxstyle="round,pad=0.2", fc="black", ec="lime", alpha=0.6))
             
-            # 画预测框 (Pred) - 红色虚线
             if len(pred_dets[i]) > 0:
                 for det in pred_dets[i]:
                     score = det[0]
                     cls_id = int(det[1])
                     pts = det[2:].reshape(4, 2)
                     cx, cy = np.mean(pts[:, 0]), np.mean(pts[:, 1]) 
-                    
                     ax.scatter(pts[:, 0], pts[:, 1], color='red', s=20, zorder=3)
                     ax.plot([pts[0, 0], pts[1, 0]], [pts[0, 1], pts[1, 1]], color='red', linewidth=2, linestyle='--')
                     ax.plot([pts[2, 0], pts[3, 0]], [pts[2, 1], pts[3, 1]], color='red', linewidth=2, linestyle='--')
-                    
-                    ax.annotate(f"Pred ID: {cls_id}",
-                                xy=(cx, cy), xycoords='data',
-                                xytext=(cx + 60, cy - 40), textcoords='data',
-                                color='red', weight='bold', fontsize=10,
-                                arrowprops=dict(arrowstyle="-", color='red', alpha=0.7),
-                                bbox=dict(boxstyle="round,pad=0.2", fc="black", ec="red", alpha=0.6))
-                    
-                    ax.annotate(f"Conf: {score:.2f}",
-                                xy=(cx, cy), xycoords='data',
-                                xytext=(cx + 60, cy + 40), textcoords='data',
-                                color='red', weight='bold', fontsize=10,
-                                arrowprops=dict(arrowstyle="-", color='red', alpha=0.7),
-                                bbox=dict(boxstyle="round,pad=0.2", fc="black", ec="red", alpha=0.6))
+                    ax.annotate(f"Pred ID: {cls_id}", xy=(cx, cy), xytext=(cx + 60, cy - 40), 
+                                color='red', weight='bold', fontsize=10, bbox=dict(boxstyle="round,pad=0.2", fc="black", ec="red", alpha=0.6))
+                    ax.annotate(f"Conf: {score:.2f}", xy=(cx, cy), xytext=(cx + 60, cy + 40), 
+                                color='red', weight='bold', fontsize=10, bbox=dict(boxstyle="round,pad=0.2", fc="black", ec="red", alpha=0.6))
             
             plt.title(f"{prefix} Set - Sample {count+1}\nGreen: GT | Red: Pred")
             plt.axis('off')
@@ -376,23 +346,18 @@ def main():
     continue_cfg = train_cfg['continue']
     go_on = False
     
-    # 获取洗牌周期
     shuffle_interval = train_cfg.get('shuffle_interval', 5)
-    
     conf_thresh = float(post_cfg.get('conf_threshold', 0.5))
     kpt_dist_thresh = float(post_cfg.get('kpt_dist_thresh', 15.0))
-
     metric_weights = train_cfg.get('metric_weights', {'pck': 0.6, 'id_acc': 0.4})
     w_pck = float(metric_weights.get('pck', 0.6))
     w_id = float(metric_weights.get('id_acc', 0.4))
-
     early_stop_cfg = train_cfg.get('early_stopping', {})
     auto_stop_enabled = early_stop_cfg.get('enabled', False)
     min_score = float(early_stop_cfg.get('min_score', 0.98))
 
     device = torch.device("cuda" if torch.cuda.is_available() and train_cfg['device'] == 'auto' else train_cfg['device'])
     save_dir = Path(train_cfg.get('save_dir', "./model_res"))
-    
     scale_ranges = data_cfg.get('scale_ranges', [[0, 64], [32, 128], [96, 9999]])
     
     # 权重保存目录安全检查
@@ -423,41 +388,31 @@ def main():
         save_dir.mkdir(parents=True, exist_ok=True)
     
     epochs = train_cfg['epochs']
-    
-    history = {
-        'train_total': [],
-        'train_pose': [],
-        'train_cls': [],
-        'val_pck': [],
-        'val_id_acc': [],
-        'val_score': [],
-        'lr': []
-    }
-
+    history = {'train_total': [], 'train_pose': [], 'train_cls': [], 'val_pck': [], 'val_id_acc': [], 'val_score': [], 'lr': []}
     input_size = tuple(train_cfg.get('input_size', [416, 416]))
     strides = train_cfg.get('strides', [8, 16, 32])
     reg_max = int(train_cfg.get('reg_max', 16)) 
-
     scaler = torch.amp.GradScaler(device.type)
     
     workers = data_cfg['num_workers'] 
     pin_mem = True if device.type == 'cuda' else False
 
     # ---------------- 增强环境初始化 ----------------
-    console.print(f"[bold cyan]正在初始化半在线数据增强环境...[/bold cyan]")
+    console.print(f"[bold cyan]正在初始化混合数据增强环境(CPU逻辑 + GPU渲染)...[/bold cyan]")
     
+    # ================= 修改 3：实例化双向数据增强管线 =================
     aug_cfg_dict = cfg['dataset']['augment']
     aug_cfg = AugmentConfig(**aug_cfg_dict)
-    
-    bg_dir = Path(aug_cfg_dict.get('bg_dir', './background'))
+    aug_pipeline = AugmentPipeline(aug_cfg)
+    # ===============================================================
+
     bg_dir_str = str(aug_cfg_dict.get('bg_dir', './background'))
-    
-    # ✅ 创建多进程安全共享变量：充当洗牌时钟
     shared_stage = multiprocessing.Value('i', 0)
-    processed_counter = multiprocessing.Value('i', 0) # <-- 新增：用于记录 CPU 已处理样本总数
+    processed_counter = multiprocessing.Value('i', 0) 
+    
     console.print(f"[bold cyan]准备数据集 (多进程 Worker={workers})...[/bold cyan]")
 
-    # 训练集：挂载增强引擎、背景库、洗牌时钟
+    # ================= 修改 4：将管线传给 Dataset =================
     train_loader = DataLoader(
         RMArmorDataset(
             data_cfg['train_img_dir'], 
@@ -467,21 +422,19 @@ def main():
             strides=strides,
             scale_ranges=scale_ranges, 
             data_name='train',
-            augment_cfg=aug_cfg,          
-            bg_dir=bg_dir_str,           # <-- 改为直接传路径字符串
+            aug_pipeline=aug_pipeline,          # 注入管线 (替代原来的 augment_cfg)
+            bg_dir=bg_dir_str,           
             shared_stage=shared_stage,
-            processed_counter=processed_counter # <-- 传给 Dataset     
+            processed_counter=processed_counter 
         ),
         batch_size=train_cfg['batch_size'],
         shuffle=True,
         num_workers=workers,
         pin_memory=pin_mem,
         persistent_workers=True if workers > 0 else False,
-        # ✅ 使用 prefetch_factor 缓解 CPU 到 GPU 的数据饥饿，保持管线顺畅
         prefetch_factor=train_cfg.get('prefetch_factor', 4) if workers > 0 else None
     )
     
-    # 验证集：绝对纯净，不包含任何增强
     val_loader = DataLoader(
         RMArmorDataset(
             data_cfg['val_img_dir'], 
@@ -491,6 +444,7 @@ def main():
             strides=strides,
             scale_ranges=scale_ranges, 
             data_name='val'
+            # 验证集不使用任何增强，保持默认
         ),
         batch_size=train_cfg['batch_size'], 
         shuffle=False, 
@@ -507,10 +461,9 @@ def main():
             model.load_state_dict(torch.load(weight_path))
             console.print(f"[bold green]成功加载历史权重：{weight_path}，继续训练。[/bold green]")
         else:
-            console.print(f"[bold yellow]警告：指定的历史权重文件 {weight_path} 不存在（可能是新文件夹或已被清除），将自动从头开始训练。[/bold yellow]")
+            console.print(f"[bold yellow]警告：指定的历史权重文件 {weight_path} 不存在，将自动从头开始训练。[/bold yellow]")
             go_on = False
 
-    # 解析 dataset.yaml 里的分类权重对抗类别不平衡
     train_img_path = Path(data_cfg['train_img_dir'])
     dataset_yaml_path = train_img_path.parent.parent / "dataset.yaml"
     class_weights_tensor = None
@@ -559,9 +512,6 @@ def main():
 
     console.print("[bold green]开始训练...[/bold green]")
     
-    # =========================================================================
-    # 【进度条高级定制区】
-    # =========================================================================
     with Progress(
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"), 
@@ -571,36 +521,32 @@ def main():
         console=console
     ) as progress:
         
-        # 将描述改为直观的倒计时
         epoch_task = progress.add_task(
             f"[bold green]Overall Training | Stage 0 | Next Shuffle: {shuffle_interval} epochs", 
             total=epochs
         )
         
         for epoch in range(1, epochs + 1):
-            
-            # ✅ 洗牌触发器
             if epoch > 1 and (epoch - 1) % shuffle_interval == 0:
                 with shared_stage.get_lock():
                     shared_stage.value += 1
-                console.print(f"\n[bold yellow]🔄 触发半在线洗牌机制！背景图与增强数据已重载，目前进入 Stage {shared_stage.value}[/bold yellow]")
+                console.print(f"\n[bold yellow]🔄 触发半在线洗牌机制！目前进入 Stage {shared_stage.value}[/bold yellow]")
             
-            # 计算距离下次洗牌还有几轮
             next_shuffle_in = shuffle_interval - ((epoch - 1) % shuffle_interval)
             
-            # 实时更新总进度条上的文本显示
             progress.update(
                 epoch_task, 
                 description=f"[bold green]Overall Training | Stage {shared_stage.value} | Next Shuffle: {next_shuffle_in} epochs"
             )
             
-            # 将 shared_stage.value 传进 train_one_epoch
+            # ================= 修改 5：将 aug_pipeline 传入训练步骤 =================
             epoch_losses = train_one_epoch(
                 model, train_loader, optimizer, criterion, device, 
                 epoch, progress, scaler, shared_stage.value,
-                processed_counter=processed_counter,            # <-- 新增
-                batch_size=train_cfg['batch_size'],             # <-- 新增
-                total_samples=len(train_loader.dataset)         # <-- 新增
+                processed_counter=processed_counter,            
+                batch_size=train_cfg['batch_size'],             
+                total_samples=len(train_loader.dataset),
+                aug_pipeline=aug_pipeline                       # 传入管线用于 GPU 计算
             )
             
             val_loss, val_pck, val_id_acc = validate(
@@ -608,7 +554,6 @@ def main():
                 input_size, strides, reg_max, conf_thresh, kpt_dist_thresh, pck_cfg
             )
             
-            # 学习率预热及调节
             if epoch <= warmup_epochs:
                 current_lr = base_lr * (epoch / warmup_epochs)
                 for param_group in optimizer.param_groups:
@@ -619,7 +564,6 @@ def main():
 
             val_score = (w_pck * val_pck) + (w_id * val_id_acc)
 
-            # 存储曲线
             history['train_total'].append(epoch_losses['total_loss'])
             history['train_pose'].append(epoch_losses['loss_pose'])
             history['train_cls'].append(epoch_losses['loss_cls'])
@@ -628,7 +572,6 @@ def main():
             history['val_score'].append(val_score)
             history['lr'].append(current_lr)
             
-            # 打印本轮日志
             console.print(
                 f"[bold cyan]Epoch {epoch}/{epochs}[/bold cyan] | "
                 f"Train Total: {epoch_losses['total_loss']:.4f} | "
@@ -642,7 +585,6 @@ def main():
                 f"Val Score: {val_score:.4f}"
             )
             
-            # 保存最佳权重
             if val_score > best_val_score:
                 best_val_score = val_score
                 torch.save(model.state_dict(), save_dir / "best_model.pth")
@@ -650,12 +592,10 @@ def main():
             
             progress.update(epoch_task, advance=1)
             
-            # 早停判定
             if auto_stop_enabled and val_score >= min_score:
                 console.print(f"\n[bold yellow]验证集综合得分 ({val_score:.4f}) 已达到设定的停止阈值，提前终止训练。[/bold yellow]")
                 break
 
-        # 保存最后一轮权重与日志图表
         torch.save(model.state_dict(), save_dir / "last_model.pth")
         save_training_curves(history, save_dir)
         
@@ -666,7 +606,6 @@ def main():
                 f.write(f"{i+1}\t{history['lr'][i]:.6f}\t{history['train_total'][i]:.6f}\t"
                         f"{history['train_pose'][i]:.6f}\t{history['train_cls'][i]:.6f}\t{history['val_pck'][i]:.6f}\n")
                 
-        # 主动释放内存，准备后续的可视化
         del train_loader
         del val_loader
         gc.collect()
@@ -693,7 +632,6 @@ def main():
         vis_train_loader = DataLoader(vis_train_dataset, batch_size=1, shuffle=True, num_workers=0)
         vis_val_loader = DataLoader(vis_val_dataset, batch_size=1, shuffle=True, num_workers=0)
         
-        # 兼容两种可视化函数名
         try:
             visualize_predictions_with_features(
                 model, vis_train_loader, device, save_dir, prefix="train", 

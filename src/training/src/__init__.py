@@ -5,7 +5,7 @@ from .model import RMDetector, decode_tensor, keypoint_nms
 from .loss import RMDetLoss
 from .datasets import RMArmorDataset
 from .hook import visualize_predictions_with_features
-from .augment import process_data, AugmentConfig
+from .augment import AugmentConfig, AugmentPipeline
 # 2. 如果你想把训练和导出的入口函数也暴露出来
 # 注意：这需要你在 train.py 和 export.py 中将核心逻辑封装进函数（见下文建议）
 # from .train import main as run_training
@@ -14,8 +14,8 @@ from .augment import process_data, AugmentConfig
 # 3. 定义逻辑分组
 
 DATASETS_AUGMENT = [
-    'process_data',
-    'AugmentConfig'
+    'AugmentConfig',
+    'AugmentPipeline'
 ]
 
 # 模型与结构
