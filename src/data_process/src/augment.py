@@ -5,9 +5,10 @@ import copy
 from dataclasses import dataclass
 from typing import Tuple, List
 from pathlib import Path
+
 @dataclass
 class AugmentConfig:
-    # --- 原有光学与形变参数保留 ... ---
+    # --- 基础与光学增强 ---
     brightness_prob: float = 0.9
     brightness_range: Tuple[float, float] = (0.2, 3.5)
     blur_prob: float = 0.7
@@ -19,9 +20,10 @@ class AugmentConfig:
     noise_prob: float = 0.7
     bloom_prob: float = 0.8
 
+    # --- 几何变换增强 ---
     flip_prob: float = 0.5
     scale_prob: float = 0.9
-    scale_range: Tuple[float, float] = (0.3, 2.5) # 兼容YAML，但在代码里严格作为“面积占比倍数”并限制安全边界
+    scale_range: Tuple[float, float] = (0.3, 2.5) 
     rotate_prob: float = 0.8
     rotate_range: Tuple[float, float] = (-45, 45)
     translate_prob: float = 0.8
@@ -29,12 +31,13 @@ class AugmentConfig:
     perspective_prob: float = 0.8
     perspective_factor: float = 0.35
 
+    # --- 背景与遮挡 ---
     bg_replace_prob: float = 0.85
     bg_dir: str = "./background"
     
-    # === 新增：ROI 多边形拉伸倍率 ===
-    roi_h_exp: float = 2.0  # 灯条高度方向外扩倍率
-    roi_w_exp: float = 1.5  # 左右灯条宽度方向外扩倍率
+    # 完美对齐 YAML 新增的拉伸倍率
+    roi_h_exp: float = 2.2  
+    roi_w_exp: float = 1.1  
 
     occ_prob: float = 0.8
     occ_radius_pct: float = 0.4
@@ -46,60 +49,6 @@ class AugmentConfig:
 
 def get_expanded_roi(pts, h_exp, w_exp):
     """基于两根灯条的向量方向，向外拉伸多边形以覆盖完整装甲板"""
-    # 0:左下, 1:左上, 2:右下, 3:右上
-    p0, p1, p2, p3 = pts[0], pts[1], pts[2], pts[3]
-    
-    # 左右灯条的中心点与方向向量
-    cl = (p0 + p1) / 2.0
-    vl = p1 - p0  
-    cr = (p2 + p3) / 2.0
-    vr = p3 - p2  
-
-    # 宽度向量 (从左灯条中心指向右灯条中心)
-    vw = cr - cl
-    W = np.linalg.norm(vw)
-    dw = vw / W if W > 0 else np.array([1.0, 0.0])
-
-    # 1. 沿灯条方向拉伸高度
-    p1_new = cl + (vl / 2.0) * h_exp
-    p0_new = cl - (vl / 2.0) * h_exp
-    p3_new = cr + (vr / 2.0) * h_exp
-    p2_new = cr - (vr / 2.0) * h_exp
-
-    # 2. 沿中心连线法向拉伸宽度
-    offset = dw * W * (w_exp - 1.0) / 2.0
-    p1_new -= offset
-    p0_new -= offset
-    p3_new += offset
-    p2_new += offset
-
-    return np.array([p0_new, p1_new, p3_new, p2_new], dtype=np.int32)
-
-def generate_composite_bg(bg_paths, w, h):
-    """生成复合堆叠背景"""
-    if not bg_paths: return np.zeros((h, w, 3), dtype=np.uint8)
-    bg = cv2.imread(str(random.choice(bg_paths)))
-    if bg is None: return np.zeros((h, w, 3), dtype=np.uint8)
-    bg = cv2.resize(bg, (w, h))
-
-    if random.random() < 0.6:
-        for _ in range(random.randint(1, 2)):
-            patch = cv2.imread(str(random.choice(bg_paths)))
-            if patch is None: continue
-            pw, ph = random.randint(int(w*0.3), int(w*0.7)), random.randint(int(h*0.3), int(h*0.7))
-            patch = cv2.resize(patch, (pw, ph))
-            px, py = random.randint(0, w - pw), random.randint(0, h - ph)
-            bg[py:py+ph, px:px+pw] = patch
-    return bg
-
-import cv2
-import random
-import numpy as np
-import copy
-
-def get_expanded_roi(pts, h_exp, w_exp):
-    """基于两根灯条的向量方向，向外拉伸多边形以覆盖完整装甲板"""
-    # 0:左下, 1:左上, 2:右下, 3:右上
     p0, p1, p2, p3 = pts[0], pts[1], pts[2], pts[3]
     
     cl = (p0 + p1) / 2.0
@@ -127,8 +76,22 @@ def get_expanded_roi(pts, h_exp, w_exp):
     return np.array([p0_new, p1_new, p3_new, p2_new], dtype=np.int32)
 
 def generate_composite_bg(bg_paths, w, h):
-    """生成复合堆叠背景"""
-    if not bg_paths: return np.zeros((h, w, 3), dtype=np.uint8)
+    """生成复合背景，如果找不到真实的背景图，生成强对比度网格以供调试"""
+    if not bg_paths: 
+        # === 兜底调试背景生成器 ===
+        # 如果没有背景图，生成一个紫绿相间的网格，让你一眼看出哪里被抠掉了、哪里是遮挡的洞
+        bg = np.zeros((h, w, 3), dtype=np.uint8)
+        grid_size = max(w, h) // 15
+        for y in range(0, h, grid_size):
+            for x in range(0, w, grid_size):
+                if (x // grid_size + y // grid_size) % 2 == 0:
+                    bg[y:y+grid_size, x:x+grid_size] = (100, 50, 150) # 紫色
+                else:
+                    bg[y:y+grid_size, x:x+grid_size] = (50, 150, 50)  # 绿色
+        noise = np.random.randint(0, 50, (h, w, 3), dtype=np.uint8)
+        return cv2.add(bg, noise)
+
+    # 正常的随机背景堆叠逻辑
     bg = cv2.imread(str(random.choice(bg_paths)))
     if bg is None: return np.zeros((h, w, 3), dtype=np.uint8)
     bg = cv2.resize(bg, (w, h))
@@ -148,7 +111,7 @@ def process_data(img, labels, cfg, bg_paths: list = None):
     aug_labels = copy.deepcopy(labels)
     h_orig, w_orig = aug_img.shape[:2]
     
-    bg_img = generate_composite_bg(bg_paths, w_orig, h_orig) if bg_paths else np.zeros_like(aug_img)
+    bg_img = generate_composite_bg(bg_paths, w_orig, h_orig)
 
     # ================= 1. 基础光学增强 =================
     if random.random() < cfg.hsv_prob:
@@ -162,9 +125,8 @@ def process_data(img, labels, cfg, bg_paths: list = None):
         factor = random.uniform(*cfg.brightness_range)
         aug_img = np.clip(aug_img.astype(np.float32) * factor, 0, 255).astype(np.uint8)
 
-    # ================= 2. 核心几何变换准备 =================
+    # ================= 2. 核心几何变换与矩阵合并 =================
     if aug_labels:
-        # --- 先做绝对翻转 ---
         if random.random() < cfg.flip_prob:
             aug_img = cv2.flip(aug_img, 1)
             for lab in aug_labels:
@@ -188,27 +150,17 @@ def process_data(img, labels, cfg, bg_paths: list = None):
             dt_x, dt_y = cfg.translate_range * w_orig, cfg.translate_range * h_orig
             tx = random.uniform(-dt_x, dt_x)
             ty = random.uniform(-dt_y, dt_y)
-            # 初步约束中心点不飞得太离谱
-            ncx, ncy = cx + tx, cy + ty
-            ncx = np.clip(ncx, w_orig * 0.1, w_orig * 0.9)
-            ncy = np.clip(ncy, h_orig * 0.1, h_orig * 0.9)
+            ncx, ncy = np.clip(cx + tx, w_orig*0.1, w_orig*0.9), np.clip(cy + ty, h_orig*0.1, h_orig*0.9)
             tx, ty = ncx - cx, ncy - cy
 
         angle = random.uniform(*cfg.rotate_range) if random.random() < cfg.rotate_prob else 0.0
 
-        # --- 组装基础 3x3 变换矩阵 M_total ---
-        T1 = np.eye(3, dtype=np.float32)
-        T1[0, 2], T1[1, 2] = -cx, -cy
-        
+        T1 = np.array([[1, 0, -cx], [0, 1, -cy], [0, 0, 1]], dtype=np.float32)
         R = np.vstack([cv2.getRotationMatrix2D((0, 0), angle, scale), [0, 0, 1]]).astype(np.float32)
+        T2 = np.array([[1, 0, cx + tx], [0, 1, cy + ty], [0, 0, 1]], dtype=np.float32)
         
-        T2 = np.eye(3, dtype=np.float32)
-        T2[0, 2], T2[1, 2] = cx + tx, cy + ty
-        
-        M_affine = T2 @ R @ T1
-        M_total = M_affine
+        M_total = T2 @ R @ T1
 
-        # 加入透视扭曲
         if random.random() < cfg.perspective_prob:
             margin = min(h_orig, w_orig) * cfg.perspective_factor
             pts1 = np.float32([[0, 0], [w_orig, 0], [0, h_orig], [w_orig, h_orig]])
@@ -219,84 +171,56 @@ def process_data(img, labels, cfg, bg_paths: list = None):
                 [w_orig - random.uniform(0, margin), h_orig - random.uniform(0, margin)]
             ])
             M_persp = cv2.getPerspectiveTransform(pts1, pts2).astype(np.float32)
-            M_total = M_persp @ M_affine 
+            M_total = M_persp @ M_total 
 
-        # ================= 3. 极速安全边界校验与数学修正 =================
-        # 预计算所有点经过变换后的物理坐标
-        all_pts = []
-        for lab in aug_labels:
-            pts = cv2.perspectiveTransform(np.array([lab['pts']], dtype=np.float32), M_total)[0]
-            all_pts.extend(pts)
-        all_pts = np.array(all_pts)
-        
+        # ================= 3. 极速安全边界校验 (兜底0.2边长) =================
+        all_pts = np.vstack([cv2.perspectiveTransform(np.array([lab['pts']], dtype=np.float32), M_total)[0] for lab in aug_labels])
         min_x, min_y = np.min(all_pts, axis=0)
         max_x, max_y = np.max(all_pts, axis=0)
         
-        # 定义安全内边距 (图像边长的 0.2 倍)
-        margin_x = w_orig * 0.2
-        margin_y = h_orig * 0.2
+        margin_x, margin_y = w_orig * 0.2, h_orig * 0.2
         
-        # 检查是否任何一个点突破了安全警戒线
         if min_x < margin_x or max_x > w_orig - margin_x or min_y < margin_y or max_y > h_orig - margin_y:
-            # 触发兜底机制：计算当前点阵的包围盒状态
-            cx_test = (min_x + max_x) / 2.0
-            cy_test = (min_y + max_y) / 2.0
-            bw_test = max_x - min_x
-            bh_test = max_y - min_y
+            cx_test, cy_test = (min_x + max_x) / 2.0, (min_y + max_y) / 2.0
+            bw_test, bh_test = max_x - min_x, max_y - min_y
             
-            # 允许的最大安全尺寸
-            safe_w = w_orig - 2 * margin_x
-            safe_h = h_orig - 2 * margin_y
+            corr_scale = min(1.0, (w_orig - 2*margin_x) / max(bw_test, 1e-6), (h_orig - 2*margin_y) / max(bh_test, 1e-6))
+            new_bw, new_bh = bw_test * corr_scale, bh_test * corr_scale
             
-            # 计算将包围盒压回安全尺寸所需的精准缩放倍率
-            corr_scale = min(1.0, safe_w / max(bw_test, 1e-6), safe_h / max(bh_test, 1e-6))
+            v_cx_min, v_cx_max = margin_x + new_bw/2.0, w_orig - margin_x - new_bw/2.0
+            v_cy_min, v_cy_max = margin_y + new_bh/2.0, h_orig - margin_y - new_bh/2.0
+            v_cx_min, v_cx_max = min(v_cx_min, v_cx_max), max(v_cx_min, v_cx_max)
+            v_cy_min, v_cy_max = min(v_cy_min, v_cy_max), max(v_cy_min, v_cy_max)
             
-            new_bw = bw_test * corr_scale
-            new_bh = bh_test * corr_scale
+            new_cx = np.clip(cx_test, v_cx_min, v_cx_max)
+            new_cy = np.clip(cy_test, v_cy_min, v_cy_max)
             
-            # 计算修补后的中心点应在哪，确保无论原矩阵平移多远，纠偏后都在安全区内
-            valid_cx_min = margin_x + new_bw / 2.0
-            valid_cx_max = w_orig - margin_x - new_bw / 2.0
-            valid_cy_min = margin_y + new_bh / 2.0
-            valid_cy_max = h_orig - margin_y - new_bh / 2.0
-            
-            # 消除因浮点误差导致的区间倒置
-            valid_cx_min, valid_cx_max = min(valid_cx_min, valid_cx_max), max(valid_cx_min, valid_cx_max)
-            valid_cy_min, valid_cy_max = min(valid_cy_min, valid_cy_max), max(valid_cy_min, valid_cy_max)
-            
-            new_cx = np.clip(cx_test, valid_cx_min, valid_cx_max)
-            new_cy = np.clip(cy_test, valid_cy_min, valid_cy_max)
-            
-            # 构建修正矩阵：先移回原点进行缩放修正，再移动到合法的中心
             T_back = np.array([[1, 0, -cx_test], [0, 1, -cy_test], [0, 0, 1]], dtype=np.float32)
             S_corr = np.array([[corr_scale, 0, 0], [0, corr_scale, 0], [0, 0, 1]], dtype=np.float32)
             T_forward = np.array([[1, 0, new_cx], [0, 1, new_cy], [0, 0, 1]], dtype=np.float32)
             
-            M_corr = T_forward @ S_corr @ T_back
-            
-            # 叠加纠偏矩阵
-            M_total = M_corr @ M_total
+            M_total = (T_forward @ S_corr @ T_back) @ M_total
 
-        # ================= 4. 一次性执行所有坐标映射 =================
+        # ================= 4. 执行映射与动态掩码 =================
         aug_img = cv2.warpPerspective(aug_img, M_total, (w_orig, h_orig), borderValue=(0, 0, 0))
         frame_mask = cv2.warpPerspective(np.ones((h_orig, w_orig), dtype=np.float32), M_total, (w_orig, h_orig), flags=cv2.INTER_NEAREST, borderValue=0)
 
         for lab in aug_labels:
             lab['pts'] = cv2.perspectiveTransform(np.array([lab['pts']], dtype=np.float32), M_total)[0]
 
-        # ================= 5. 后置动态生成目标蒙版 =================
         roi_mask = np.zeros((h_orig, w_orig), dtype=np.float32)
         for lab in aug_labels:
             expanded_hull = get_expanded_roi(lab['pts'], cfg.roi_h_exp, cfg.roi_w_exp)
             cv2.fillPoly(roi_mask, [expanded_hull], 1.0)
         roi_mask = cv2.dilate(roi_mask, np.ones((7, 7), np.uint8), iterations=1)
 
-    # ================= 6. 背景融合与遮挡 =================
-    if bg_paths and random.random() < cfg.bg_replace_prob:
+    # ================= 5. 背景融合与遮挡挖洞 =================
+    if random.random() < cfg.bg_replace_prob:
         blend_mask = roi_mask if aug_labels else np.zeros((h_orig, w_orig), dtype=np.float32)
     else:
         blend_mask = frame_mask if aug_labels else np.ones((h_orig, w_orig), dtype=np.float32)
 
+    # 在掩码上挖洞 (设为 0)，渲染时直接透出底层的背景 (bg_img)
     if aug_labels and random.random() < cfg.occ_prob:
         radius = min(w_orig, h_orig) * cfg.occ_radius_pct
         for lab in aug_labels:
@@ -312,15 +236,16 @@ def process_data(img, labels, cfg, bg_paths: list = None):
 
     blend_mask = cv2.GaussianBlur(blend_mask, (7, 7), 0)
     blend_3d = np.expand_dims(blend_mask, axis=-1)
+    # 此处合成：1的位置保留装甲板，0的位置（原图死黑边、遮挡孔洞、全屏被替换区）透出背景图
     aug_img = (aug_img.astype(np.float32) * blend_3d + bg_img.astype(np.float32) * (1 - blend_3d)).astype(np.uint8)
 
-    # ================= 7. 最终画质劣化与边界检查 =================
+    # ================= 6. 最终画质劣化 (应用在混合后的图像上) =================
     if random.random() < cfg.blur_prob:
         ksize = random.choice(cfg.blur_ksize)
         aug_img = cv2.blur(aug_img, (ksize, ksize))
 
     if random.random() < cfg.noise_prob:
-        noise = np.random.normal(0, 20, aug_img.shape).astype(np.float32)
+        noise = np.random.normal(0, 25, aug_img.shape).astype(np.float32) # 加强了噪声体现
         aug_img = np.clip(aug_img.astype(np.float32) + noise, 0, 255).astype(np.uint8)
 
     if aug_labels and random.random() < cfg.bloom_prob:
@@ -328,7 +253,7 @@ def process_data(img, labels, cfg, bg_paths: list = None):
         for lab in aug_labels:
             center = np.mean(lab['pts'], axis=0).astype(int)
             cv2.circle(bloom_layer, tuple(center), int(min(h_orig, w_orig) * 0.05), (255, 255, 255), -1)
-        bloom_layer = cv2.GaussianBlur(bloom_layer, (31, 31), sigmaX=20)
+        bloom_layer = cv2.GaussianBlur(bloom_layer, (3, 3), sigmaX=20)
         aug_img = np.clip(aug_img.astype(np.float32) + bloom_layer * 0.4, 0, 255).astype(np.uint8)
 
     if aug_labels:
@@ -339,9 +264,9 @@ def process_data(img, labels, cfg, bg_paths: list = None):
 
     return aug_img, aug_labels
 
-    # ================= 测试代码 =================
+# ================= 测试代码 =================
 if __name__ == "__main__":
-    import yaml  # 确保导入了 yaml 模块
+    import yaml
 
     def parse_labels_for_test(label_path):
         parsed = []
@@ -357,7 +282,6 @@ if __name__ == "__main__":
         
     cfg = AugmentConfig()
     
-    # 1. 从 config.yaml 动态加载参数范围与设定
     yaml_path = Path("config.yaml")
     if yaml_path.exists():
         with open(yaml_path, 'r', encoding='utf-8') as f:
@@ -367,18 +291,20 @@ if __name__ == "__main__":
                 if aug_data:
                     for k, v in aug_data.items():
                         if hasattr(cfg, k):
-                            # 将长度为2的list转为tuple (兼容 range 参数)
                             if isinstance(v, list) and len(v) == 2 and k != 'blur_ksize':
                                 v = tuple(v)
                             setattr(cfg, k, v)
-                print(f"✅ 已成功从 {yaml_path} 加载变换参数。")
+                print(f"✅ 已成功从 {yaml_path} 加载参数。")
             except Exception as e:
-                print(f"❌ 读取 config.yaml 失败: {e}，将使用默认参数。")
-    else:
-        print(f"⚠️ 未找到 {yaml_path}，将使用默认参数。")
+                print(f"❌ 读取 config.yaml 失败: {e}")
+    
+    bg_dir = Path(cfg.bg_dir)
+    bg_paths = list(bg_dir.glob("*.jpg")) + list(bg_dir.glob("*.png")) if bg_dir.exists() else []
+    
+    if not bg_paths:
+        print("⚠️  警告：未找到背景图片！已自动启用紫绿网格作为测试替代背景。")
 
-    # 2. 强制将所有执行概率设为 1.0 (确保每张图都完整经历所有增强变换)
-    cfg.brightness_prob = 1.0
+    # 1. 强制所有变换发生
     cfg.blur_prob = 1.0
     cfg.hsv_prob = 1.0
     cfg.noise_prob = 1.0
@@ -391,15 +317,15 @@ if __name__ == "__main__":
     cfg.bg_replace_prob = 1.0
     cfg.occ_prob = 1.0
     
+    # 2. 【关键】限制测试时的亮度，避免画面死黑导致完全看不出效果
+    cfg.brightness_prob = 1.0
+    cfg.brightness_range = (0.8, 1.5)  
+
     dataset_dir = Path("./data/balance")
     train_images = list((dataset_dir / "0" / "photos").glob("*.jpg"))
     train_labels_dir = dataset_dir / "0" / "labels"
     
-    # 抽取3张图片测试
     test_samples = random.sample(train_images, min(3, len(train_images))) if train_images else []
-    
-    bg_dir = Path(cfg.bg_dir)
-    bg_paths = list(bg_dir.glob("*.jpg")) + list(bg_dir.glob("*.png")) if bg_dir.exists() else []
     
     out_dir = Path("./data/test/augment")
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -414,11 +340,8 @@ if __name__ == "__main__":
         if label_path.exists():
             labels = parse_labels_for_test(label_path)
             
-        # 生成10个变体观察效果
-        for v in range(10):
+        for v in range(3):
             aug_img, aug_lbls = process_data(img, labels, cfg, bg_paths)
-            
-            # 画上绿点用于检查几何映射对不对
             viz_img = aug_img.copy()
             for lbl in aug_lbls:
                 if lbl['vis'] > 0:
