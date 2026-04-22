@@ -338,7 +338,7 @@ def process_data(img, labels, cfg, bg_paths: list = None):
                 roi = aug_img[iy1:iy2, ix1:ix2].astype(np.float32)
                 roi = np.clip(roi + patch_g * color * intensity, 0, 255)
                 aug_img[iy1:iy2, ix1:ix2] = roi.astype(np.uint8)
-                
+
     if aug_labels:
         for lab in aug_labels:
             out_count = sum(1 for pt in lab['pts'] if pt[0] < 0 or pt[0] >= w_orig or pt[1] < 0 or pt[1] >= h_orig)
@@ -405,8 +405,8 @@ if __name__ == "__main__":
     cfg.brightness_range = (0.8, 1.5)  
 
     dataset_dir = Path("./data/balance")
-    train_images = list((dataset_dir / "0" / "photos").glob("*.jpg"))
-    train_labels_dir = dataset_dir / "0" / "labels"
+    train_images = list((dataset_dir / "2" / "photos").glob("*.jpg"))
+    train_labels_dir = dataset_dir / "2" / "labels"
     
     test_samples = random.sample(train_images, min(3, len(train_images))) if train_images else []
     
