@@ -296,35 +296,37 @@ def process_data(img, labels, cfg, bg_paths: list = None):
             cx = int(random.uniform(min_x, max_x))
             cy = int(random.uniform(min_y, max_y))
 
-            # 2. 根据装甲板面积比例动态计算光晕半径
-            # 使用 cv2.contourArea 获取当前多边形的准确面积，最低限制为 1.0 避免除零
+            # 2. 根据装甲板面积比例动态计算【高亮核心半径】
             plate_area = max(1.0, cv2.contourArea(pts.astype(np.float32)))
-            
-            # 随机取一个面积比例
             area_ratio = random.uniform(*cfg.bloom_prob_area_range)
             bloom_area = plate_area * area_ratio
             
-            # 圆面积公式反推半径
-            radius = int(np.sqrt(bloom_area / np.pi))
+            # 圆面积公式反推高亮核心的半径
+            core_radius = int(np.sqrt(bloom_area / np.pi))
 
-            # 如果算出来的半径太小（比如目标本身太远太小），就跳过光晕
-            if radius < 3:
+            # 如果算出来的核心太小（比如远距离的小板子），跳过光晕避免满屏噪点
+            if core_radius < 2:
                 continue
 
-            # 3. 生成局部高斯光晕贴图
-            size = radius * 2 + 1
-            x_grid, y_grid = np.meshgrid(np.linspace(-1, 1, size), np.linspace(-1, 1, size))
+            # 3. 核心修复：生成局部高斯光晕贴图，贴图必须比核心大以容纳自然衰减
+            patch_radius = core_radius * 3  # 贴图范围是核心的 3 倍
+            size = patch_radius * 2 + 1
+            
+            # 将网格映射到 -3 到 3 的空间
+            x_grid, y_grid = np.meshgrid(np.linspace(-3, 3, size), np.linspace(-3, 3, size))
             d = np.sqrt(x_grid**2 + y_grid**2)
 
-            sigma = random.uniform(0.15, 0.35)
+            # 控制衰减速度：当 sigma=1.0 时，d=1 (即恰好处于 core_radius 边界) 处亮度约保留 60%
+            sigma = random.uniform(0.8, 1.2)
             g = np.exp(-(d**2 / (2.0 * sigma**2)))
             g = np.clip(g, 0, 1)
 
             color = np.array([random.randint(220, 255), random.randint(220, 255), random.randint(220, 255)], dtype=np.float32)
             intensity = random.uniform(0.8, 1.5)
 
-            x1, y1 = cx - radius, cy - radius
-            x2, y2 = cx + radius + 1, cy + radius + 1
+            # 坐标边界计算必须使用扩充后的 patch_radius
+            x1, y1 = cx - patch_radius, cy - patch_radius
+            x2, y2 = cx + patch_radius + 1, cy + patch_radius + 1
 
             ix1, iy1 = max(0, x1), max(0, y1)
             ix2, iy2 = min(w_orig, x2), min(h_orig, y2)
@@ -336,6 +338,7 @@ def process_data(img, labels, cfg, bg_paths: list = None):
                 roi = aug_img[iy1:iy2, ix1:ix2].astype(np.float32)
                 roi = np.clip(roi + patch_g * color * intensity, 0, 255)
                 aug_img[iy1:iy2, ix1:ix2] = roi.astype(np.uint8)
+                
     if aug_labels:
         for lab in aug_labels:
             out_count = sum(1 for pt in lab['pts'] if pt[0] < 0 or pt[0] >= w_orig or pt[1] < 0 or pt[1] >= h_orig)
