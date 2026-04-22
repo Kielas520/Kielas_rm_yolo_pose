@@ -264,7 +264,7 @@ def validate(model, dataloader, criterion, device, epoch, progress, input_size, 
     return avg_loss, pck_accuracy, id_accuracy
 
 @torch.no_grad()
-def visualize_predictions(model, dataloader, device, save_dir, prefix, progress, input_size, strides, reg_max, num_samples=5, conf_threshold=0.5, kpt_dist_thresh=14.5):
+def visualize_predictions(model, dataloader, device, save_dir, prefix, progress, input_size, strides, reg_max, num_samples=5, conf_threshold=0.5, kpt_dist_thresh=14.5, aug_pipeline=None):
     """输出可视化效果图，便于人工检验模型识别精度"""
     model.eval()
     count = 0
@@ -272,6 +272,11 @@ def visualize_predictions(model, dataloader, device, save_dir, prefix, progress,
     
     for imgs, targets, class_ids in dataloader:
         imgs = imgs.to(device)
+
+        # 2. 补充 GPU 增强调用 (仅在查看 train 样本且存在管线时触发)
+        if prefix == "train" and aug_pipeline is not None:
+            imgs = aug_pipeline.process_gpu(imgs)
+
         targets = [t.to(device) for t in targets]
         class_ids = [c.to(device) for c in class_ids]
         preds = model(imgs) 
@@ -621,7 +626,10 @@ def main():
         
         vis_train_dataset = RMArmorDataset(
             data_cfg['train_img_dir'], data_cfg['train_label_dir'], data_cfg['class_id'],
-            input_size=input_size, strides=strides, data_name='vis_train'
+            input_size=input_size, strides=strides, data_name='vis_train',
+            aug_pipeline=aug_pipeline,   # 接入增强管线
+            bg_dir=bg_dir_str,           # 接入背景图片目录
+            shared_stage=shared_stage    # 同步洗牌种子
         )
         
         vis_val_dataset = RMArmorDataset(
