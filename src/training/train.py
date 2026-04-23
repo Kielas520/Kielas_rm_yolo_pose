@@ -7,6 +7,7 @@ import torchvision
 import multiprocessing
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 import time
+from functools import partial
 
 # =========================================================================
 # 【系统级优化】
@@ -27,7 +28,7 @@ from pathlib import Path
 import shutil
 import gc
 
-# 导入自定义模块 (确保 AugmentPipeline 能够被正确导入)
+# 导入自定义模块
 from src.training.src import *
 
 console = Console()
@@ -53,7 +54,6 @@ def save_training_curves(history, save_dir):
     plot_and_save_curve(history['train_cls'], epochs, 'Classification Loss', 'Loss', save_dir / "loss_cls.png", 'brown')
     plot_and_save_curve(history['val_pck'], epochs, 'Validation PCK@0.5', 'PCK', save_dir / "val_pck.png", 'r')
 
-# ================= 修改 1：函数签名增加 aug_pipeline 参数 =================
 def train_one_epoch(model, dataloader, optimizer, criterion, device, epoch, progress, scaler, current_stage, processed_counter, batch_size, total_samples, aug_pipeline):
     model.train()
     
@@ -71,11 +71,9 @@ def train_one_epoch(model, dataloader, optimizer, criterion, device, epoch, prog
         targets = [t.to(device) for t in targets]
         class_ids = [c.to(device) for c in class_ids]
         
-        # ================= 修改 2：执行 GPU 级像素增强 =================
-        # 此时 imgs 已经在 GPU 上，调用管线进行色彩、光晕、模糊等极速张量运算
+        # 2. 执行 GPU 级像素增强
         if aug_pipeline is not None:
             imgs = aug_pipeline.process_gpu(imgs)
-        # ============================================================
 
         optimizer.zero_grad()
         
@@ -92,7 +90,6 @@ def train_one_epoch(model, dataloader, optimizer, criterion, device, epoch, prog
         for k in epoch_losses:
             epoch_losses[k] += loss_dict[k]
             
-        # 队列深度计算
         total_consumed = (epoch - 1) * total_samples + (batch_idx + 1) * batch_size
         with processed_counter.get_lock():
             total_produced = processed_counter.value
@@ -175,7 +172,8 @@ def calculate_pck(gt_batch, pred_batch, pck_cfg):
                 
     return correct_kpts, total_kpts, correct_ids, total_gts
 
-def process_multi_scale_dets(preds, targets, class_ids, strides, input_size, reg_max, conf_thresh, kpt_dist_thresh):
+# 【修改点】：动态传入 num_classes
+def process_multi_scale_dets(preds, targets, class_ids, strides, input_size, reg_max, conf_thresh, kpt_dist_thresh, num_classes=13):
     """处理并合并多尺度预测结果，执行 NMS"""
     batch_size = preds[0].size(0)
     gt_dets_batch = [[] for _ in range(batch_size)]
@@ -184,8 +182,8 @@ def process_multi_scale_dets(preds, targets, class_ids, strides, input_size, reg
     for i, s in enumerate(strides):
         current_grid = (input_size[0] // s, input_size[1] // s)
         
-        gt_scale = decode_tensor(targets[i], is_pred=False, class_tensor=class_ids[i], conf_threshold=0.9, kpt_dist_thresh=kpt_dist_thresh, grid_size=current_grid, reg_max=reg_max, img_size=input_size)
-        pred_scale = decode_tensor(preds[i], is_pred=True, conf_threshold=conf_thresh, kpt_dist_thresh=kpt_dist_thresh, grid_size=current_grid, reg_max=reg_max, img_size=input_size)
+        gt_scale = decode_tensor(targets[i], is_pred=False, class_tensor=class_ids[i], conf_threshold=0.9, kpt_dist_thresh=kpt_dist_thresh, grid_size=current_grid, reg_max=reg_max, img_size=input_size, num_classes=num_classes)
+        pred_scale = decode_tensor(preds[i], is_pred=True, conf_threshold=conf_thresh, kpt_dist_thresh=kpt_dist_thresh, grid_size=current_grid, reg_max=reg_max, img_size=input_size, num_classes=num_classes)
         
         for b in range(batch_size):
             if len(gt_scale[b]) > 0:
@@ -223,8 +221,8 @@ def process_multi_scale_dets(preds, targets, class_ids, strides, input_size, reg
     return final_gt_dets, final_pred_dets
 
 @torch.no_grad()
-def validate(model, dataloader, criterion, device, epoch, progress, input_size, strides, reg_max, conf_thresh, kpt_dist_thresh, pck_cfg):
-    """验证集评估，注意验证集绝对不使用任何在线数据增强"""
+# 【修改点】：动态传入 num_classes
+def validate(model, dataloader, criterion, device, epoch, progress, input_size, strides, reg_max, conf_thresh, kpt_dist_thresh, pck_cfg, num_classes=13):
     model.eval()
     total_loss = 0.0
     total_correct_kpts = 0
@@ -245,7 +243,7 @@ def validate(model, dataloader, criterion, device, epoch, progress, input_size, 
             
         total_loss += loss.item()
         
-        gt_dets, pred_dets = process_multi_scale_dets(preds, targets, class_ids, strides, input_size, reg_max, conf_thresh, kpt_dist_thresh)
+        gt_dets, pred_dets = process_multi_scale_dets(preds, targets, class_ids, strides, input_size, reg_max, conf_thresh, kpt_dist_thresh, num_classes)
         correct_k, total_k, correct_id, total_gt = calculate_pck(gt_dets, pred_dets, pck_cfg)
         
         total_correct_kpts += correct_k
@@ -264,8 +262,8 @@ def validate(model, dataloader, criterion, device, epoch, progress, input_size, 
     return avg_loss, pck_accuracy, id_accuracy
 
 @torch.no_grad()
-def visualize_predictions(model, dataloader, device, save_dir, prefix, progress, input_size, strides, reg_max, num_samples=5, conf_threshold=0.5, kpt_dist_thresh=14.5, aug_pipeline=None):
-    """输出可视化效果图，便于人工检验模型识别精度"""
+# 【修改点】：动态传入 num_classes
+def visualize_predictions(model, dataloader, device, save_dir, prefix, progress, input_size, strides, reg_max, num_samples=5, conf_threshold=0.5, kpt_dist_thresh=14.5, aug_pipeline=None, num_classes=13):
     model.eval()
     count = 0
     task_id = progress.add_task(f"[yellow]导出 {prefix} 图像...", total=num_samples)
@@ -273,7 +271,6 @@ def visualize_predictions(model, dataloader, device, save_dir, prefix, progress,
     for imgs, targets, class_ids in dataloader:
         imgs = imgs.to(device)
 
-        # 2. 补充 GPU 增强调用 (仅在查看 train 样本且存在管线时触发)
         if prefix == "train" and aug_pipeline is not None:
             imgs = aug_pipeline.process_gpu(imgs)
 
@@ -281,7 +278,7 @@ def visualize_predictions(model, dataloader, device, save_dir, prefix, progress,
         class_ids = [c.to(device) for c in class_ids]
         preds = model(imgs) 
         
-        gt_dets, pred_dets = process_multi_scale_dets(preds, targets, class_ids, strides, input_size, reg_max, conf_threshold, kpt_dist_thresh)
+        gt_dets, pred_dets = process_multi_scale_dets(preds, targets, class_ids, strides, input_size, reg_max, conf_threshold, kpt_dist_thresh, num_classes)
         
         for i in range(imgs.size(0)):
             if count >= num_samples:
@@ -351,6 +348,9 @@ def main():
     continue_cfg = train_cfg['continue']
     go_on = False
     
+    # 【修复 1】：动态获取总类别数
+    num_classes = int(train_cfg.get('num_classes', 13))
+    
     shuffle_interval = train_cfg.get('shuffle_interval', 5)
     conf_thresh = float(post_cfg.get('conf_threshold', 0.5))
     kpt_dist_thresh = float(post_cfg.get('kpt_dist_thresh', 15.0))
@@ -365,7 +365,6 @@ def main():
     save_dir = Path(train_cfg.get('save_dir', "./model_res"))
     scale_ranges = data_cfg.get('scale_ranges', [[0, 64], [32, 128], [96, 9999]])
     
-    # 权重保存目录安全检查
     if save_dir.exists() and any(save_dir.iterdir()):
         choice = Prompt.ask(
             f"\n[bold yellow]输出文件夹 '{save_dir}' 已存在且非空，请选择操作：[/bold yellow]\n"
@@ -402,14 +401,11 @@ def main():
     workers = data_cfg['num_workers'] 
     pin_mem = True if device.type == 'cuda' else False
 
-    # ---------------- 增强环境初始化 ----------------
     console.print(f"[bold cyan]正在初始化混合数据增强环境(CPU逻辑 + GPU渲染)...[/bold cyan]")
     
-    # ================= 修改 3：实例化双向数据增强管线 =================
     aug_cfg_dict = cfg['dataset']['augment']
     aug_cfg = AugmentConfig(**aug_cfg_dict)
     aug_pipeline = AugmentPipeline(aug_cfg)
-    # ===============================================================
 
     bg_dir_str = str(aug_cfg_dict.get('bg_dir', './background'))
     shared_stage = multiprocessing.Value('i', 0)
@@ -417,7 +413,6 @@ def main():
     
     console.print(f"[bold cyan]准备数据集 (多进程 Worker={workers})...[/bold cyan]")
 
-    # ================= 修改 4：将管线传给 Dataset =================
     train_loader = DataLoader(
         RMArmorDataset(
             data_cfg['train_img_dir'], 
@@ -427,7 +422,7 @@ def main():
             strides=strides,
             scale_ranges=scale_ranges, 
             data_name='train',
-            aug_pipeline=aug_pipeline,          # 注入管线 (替代原来的 augment_cfg)
+            aug_pipeline=aug_pipeline,
             bg_dir=bg_dir_str,           
             shared_stage=shared_stage,
             processed_counter=processed_counter 
@@ -449,7 +444,6 @@ def main():
             strides=strides,
             scale_ranges=scale_ranges, 
             data_name='val'
-            # 验证集不使用任何增强，保持默认
         ),
         batch_size=train_cfg['batch_size'], 
         shuffle=False, 
@@ -458,7 +452,8 @@ def main():
         persistent_workers=True if workers > 0 else False
     )
 
-    model = RMDetector(reg_max=reg_max).to(device)
+    # 【修复 2】：传递给 RMDetector
+    model = RMDetector(reg_max=reg_max, num_classes=num_classes).to(device)
     
     if go_on:
         weight_path = Path(continue_cfg['path'])
@@ -478,7 +473,7 @@ def main():
             ds_cfg = yaml.safe_load(f)
             weights_dict = ds_cfg.get('weights', {})
             if weights_dict:
-                num_classes = 12 
+                # 【修复 3】：从动态 num_classes 获取权重长度，避免越界和忽略
                 weights_list = [1.0] * num_classes
                 for cls_idx, weight in weights_dict.items():
                     if int(cls_idx) < num_classes:
@@ -489,6 +484,7 @@ def main():
     else:
         console.print(f"[bold yellow]警告：未在 {dataset_yaml_path.parent} 下找到 dataset.yaml，将不使用类别加权。[/bold yellow]")
 
+    # 【修复 4】：传递给 RMDetLoss
     criterion = RMDetLoss(
         lambda_pose=loss_cfg.get('lambda_pose', 1.5),
         lambda_cls=loss_cfg.get('lambda_cls', 1.0),
@@ -497,6 +493,7 @@ def main():
         reg_max=reg_max,
         omega=loss_cfg.get('omega', 10.0),
         epsilon=loss_cfg.get('epsilon', 2.0),
+        num_classes=num_classes,
         class_weights=class_weights_tensor
     ).to(device)
     
@@ -544,19 +541,19 @@ def main():
                 description=f"[bold green]Overall Training | Stage {shared_stage.value} | Next Shuffle: {next_shuffle_in} epochs"
             )
             
-            # ================= 修改 5：将 aug_pipeline 传入训练步骤 =================
             epoch_losses = train_one_epoch(
                 model, train_loader, optimizer, criterion, device, 
                 epoch, progress, scaler, shared_stage.value,
                 processed_counter=processed_counter,            
                 batch_size=train_cfg['batch_size'],             
                 total_samples=len(train_loader.dataset),
-                aug_pipeline=aug_pipeline                       # 传入管线用于 GPU 计算
+                aug_pipeline=aug_pipeline                       
             )
             
+            # 【修复 5】：传递给验证集过程
             val_loss, val_pck, val_id_acc = validate(
                 model, val_loader, criterion, device, epoch, progress, 
-                input_size, strides, reg_max, conf_thresh, kpt_dist_thresh, pck_cfg
+                input_size, strides, reg_max, conf_thresh, kpt_dist_thresh, pck_cfg, num_classes
             )
             
             if epoch <= warmup_epochs:
@@ -627,9 +624,9 @@ def main():
         vis_train_dataset = RMArmorDataset(
             data_cfg['train_img_dir'], data_cfg['train_label_dir'], data_cfg['class_id'],
             input_size=input_size, strides=strides, data_name='vis_train',
-            aug_pipeline=aug_pipeline,   # 接入增强管线
-            bg_dir=bg_dir_str,           # 接入背景图片目录
-            shared_stage=shared_stage    # 同步洗牌种子
+            aug_pipeline=aug_pipeline,   
+            bg_dir=bg_dir_str,           
+            shared_stage=shared_stage    
         )
         
         vis_val_dataset = RMArmorDataset(
@@ -641,28 +638,31 @@ def main():
         vis_val_loader = DataLoader(vis_val_dataset, batch_size=1, shuffle=True, num_workers=0)
         
         try:
+            # 【修复 6】：将绑定好 num_classes 的解码函数传递给 hook 特征图生成器
+            bound_process_multi_scale_dets = partial(process_multi_scale_dets, num_classes=num_classes)
+            
             visualize_predictions_with_features(
                 model, vis_train_loader, device, save_dir, prefix="train", 
                 progress=progress, input_size=input_size, strides=strides, reg_max=reg_max, 
-                process_multi_scale_dets_fn=process_multi_scale_dets,
+                process_multi_scale_dets_fn=bound_process_multi_scale_dets,
                 num_samples=5, conf_threshold=conf_thresh, kpt_dist_thresh=kpt_dist_thresh
             )
             visualize_predictions_with_features(
                 model, vis_val_loader, device, save_dir, prefix="val", 
                 progress=progress, input_size=input_size, strides=strides, reg_max=reg_max, 
-                process_multi_scale_dets_fn=process_multi_scale_dets,
+                process_multi_scale_dets_fn=bound_process_multi_scale_dets,
                 num_samples=5, conf_threshold=conf_thresh, kpt_dist_thresh=kpt_dist_thresh
             )
         except NameError:
             visualize_predictions(
                 model, vis_train_loader, device, save_dir, prefix="train", 
                 progress=progress, input_size=input_size, strides=strides, reg_max=reg_max,
-                num_samples=5, conf_threshold=conf_thresh, kpt_dist_thresh=kpt_dist_thresh
+                num_samples=5, conf_threshold=conf_thresh, kpt_dist_thresh=kpt_dist_thresh, aug_pipeline=aug_pipeline, num_classes=num_classes
             )
             visualize_predictions(
                 model, vis_val_loader, device, save_dir, prefix="val", 
                 progress=progress, input_size=input_size, strides=strides, reg_max=reg_max,
-                num_samples=5, conf_threshold=conf_thresh, kpt_dist_thresh=kpt_dist_thresh
+                num_samples=5, conf_threshold=conf_thresh, kpt_dist_thresh=kpt_dist_thresh, num_classes=num_classes
             )
 
     console.print(f"\n[bold green]训练与评估完成！所有结果已保存至: {save_dir.absolute()}[/bold green]")

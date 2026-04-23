@@ -10,7 +10,7 @@ def load_config(config_path="config.yaml"):
         return None
     with open(p, 'r', encoding='utf-8') as f:
         config = yaml.safe_load(f)
-        return config.get('kielas_rm_train', {}).get('negative_sampler', {})
+        return config.get('kielas_rm_train', {}).get('sampler', {})
 
 def get_next_index(export_dir: Path, class_id: int) -> int:
     """扫描现有文件夹，获取该类别的下一个文件序号"""

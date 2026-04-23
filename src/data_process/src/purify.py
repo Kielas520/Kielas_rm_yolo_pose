@@ -34,7 +34,8 @@ def get_frame_center(lines: List[str], expected_class_id: str) -> Tuple[Optional
 
     for line in lines:
         parts = line.strip().split()
-        if len(parts) < 10:
+        # 【修改点】：放宽长度限制到 9
+        if len(parts) < 9:
             continue
         try:
             class_id_int = int(parts[0])
@@ -45,7 +46,12 @@ def get_frame_center(lines: List[str], expected_class_id: str) -> Tuple[Optional
             return None, "ID_ERROR"
 
         try:
-            coords = [float(x) for x in parts[2:10]]
+            # 【修改点】：自动兼容带 color(>=10) 和不带 color(9) 的数据
+            if len(parts) >= 10:
+                coords = [float(x) for x in parts[2:10]]
+            else:
+                coords = [float(x) for x in parts[1:9]]
+                
             center_x = sum(coords[0::2]) / 4.0
             center_y = sum(coords[1::2]) / 4.0
             centers.append((center_x, center_y))
@@ -85,16 +91,13 @@ def purify_dataset_pipeline(raw_dir: str, output_dir: str, distance_threshold: f
         console.print(f"[bold red]错误：[/bold red]找不到原始目录 {raw_path}")
         return
 
-    # ==========================================
-    # 新增：检测并刷新输出文件夹
-    # ==========================================
+    # 检测并刷新输出文件夹
     if out_path.exists():
         console.print(f"[yellow]检测到输出目录已存在，正在清理旧数据: {out_path}[/yellow]")
         shutil.rmtree(out_path)
     
     # 重新创建干净的输出主目录
     out_path.mkdir(parents=True, exist_ok=True)
-    # ==========================================
 
     # 1. 预扫描
     valid_class_dirs = []

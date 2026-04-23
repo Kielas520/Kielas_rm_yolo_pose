@@ -34,7 +34,7 @@ def io_worker(task_queue: Queue, progress: Progress, task_id):
             
         in_label, out_label, in_photo, out_photo = task
         
-        # 1. 重新格式化标签：剔除 color (索引为 1 的列)
+        # 1. 重新格式化标签：剔除 color (统一成 9 维)
         try:
             with open(in_label, 'r', encoding='utf-8') as f:
                 lines = f.readlines()
@@ -42,8 +42,11 @@ def io_worker(task_queue: Queue, progress: Progress, task_id):
             new_lines = []
             for line in lines:
                 parts = line.strip().split()
+                # 【修改点】：兼容 10 位和 9 位，统一去掉 color
                 if len(parts) >= 10: 
                     parts.pop(1)  # 移除 color 列
+                    new_lines.append(" ".join(parts) + "\n")
+                elif len(parts) == 9:
                     new_lines.append(" ".join(parts) + "\n")
                 
             with open(out_label, 'w', encoding='utf-8') as f:

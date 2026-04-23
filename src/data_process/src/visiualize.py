@@ -2,6 +2,7 @@ import random
 import cv2
 import shutil
 from pathlib import Path
+from collections import defaultdict
 
 def visualize_dataset(root_path: str, data_type: str = "train", if_flag: list = None): # type: ignore
     if if_flag is None:
@@ -65,8 +66,21 @@ def visualize_dataset(root_path: str, data_type: str = "train", if_flag: list = 
         print(f"在 {type_dir} 下未发现任何图片")
         return
 
-    sample_size = min(12, len(all_data))
-    sampled_data = random.sample(all_data, sample_size)
+    # === 核心修改：改为按类别分组均匀抽样 ===
+    class_groups = defaultdict(list)
+    for item in all_data:
+        # item 结构: (img_path, label_path, class_id)
+        class_groups[item[2]].append(item)
+        
+    sampled_data = []
+    samples_per_class = 3  # 每个类别固定抽 3 张图片
+    
+    for cid, items in class_groups.items():
+        size = min(samples_per_class, len(items))
+        sampled_data.extend(random.sample(items, size))
+        
+    sample_size = len(sampled_data)
+    # =======================================
     
     has_flag = (if_flag[0] == 1)
     flag_type = if_flag[1] 
