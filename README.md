@@ -1,115 +1,100 @@
-# Kielas RM Detector Train
+# K-Vision
 
-本项目是一个专为 RoboMaster 视觉打造的端到端装甲板关键点检测与分类模型训练框架。
-包含从 ROS2 Bag 数据提取、自动化数据清洗与增强，到模型训练、格式导出以及多端推理演示的完整流水线。
+K-Vision 是一个针对 RoboMaster (RM) 视觉任务设计的端到端关键点检测神经网络框架。项目涵盖了从 ROS2 Bag 数据提取、自动化清洗、极端数据增强、模型训练，到最终 ONNX 导出和硬同步推理的完整工作流。
 
-## 🌟 核心特性
+## 🚀 核心特性
 
-- **一站式交互终端**：提供基于 `rich` 的命令行 UI (`main.py`)，轻松调度所有流水线脚本。
-- **现代化依赖管理**：基于 `uv` 和 `pyproject.toml`，跨平台支持并自动隔离环境。
-- **高鲁棒性数据管道**：内置数据去重、类别均衡、定向增强（仅增强训练集）和动态背景替换功能。
-- **定制化网络架构**：轻量级 Backbone + PANet 特征融合 + 多分支 Head，联合 Focal Loss、CIoU 与 OKS 损失进行优化。
-- **快速部署验证**：一键导出 ONNX/TorchScript，并内置接入普通 USB 相机与海康工业相机的推理 Demo。
+* **统一的控制台入口**: 提供基于 `rich` 构建的 `main.py` 交互式终端，一键调度数据处理、训练、导出与推理演示。
+* **极致的数据增强管线**:
+    * **CPU 端 (几何与上下文)**: 随机透视变换、旋转、缩放、多边形遮挡（模拟战损与枪管）、全天候背景动态融合。
+    * **GPU 端 (光学畸变)**: 基于 `torchvision` 张量运算，极速模拟高斯模糊、HSV 偏移、高增益雪花噪声以及极限光晕 (Bloom)。
+* **轻量级且高精度的模型架构**:
+    * **Backbone**: 深度可分离卷积 (Depthwise Separable Conv) + SPPF 空间金字塔池化。
+    * **Neck & Head**: FPN + PAN 多尺度特征融合，搭配解耦头 (Decoupled Head) 直接回归 8 个角点坐标。
+* **复合损失函数**: 结合 Focal Loss (分类)、Distribution Focal Loss (DFL)、Wing Loss (回归)、OKS 以及装甲板中心结构化惩罚损失 (Structural Loss)。
+* **部署友好**: 深度适配 ONNX 与 TorchScript，内置基于关键点距离的自定义 NMS，支持标准 UVC 相机与海康 (Hikvision) 工业相机原生调用。
 
-## ⚙️ 环境配置
+---
 
-本项目推荐使用 `uv` 进行快速环境构建与包管理。项目根目录已包含 `pyproject.toml`。
+## 📂 目录结构
+
+```text
+K-Vision/
+├── config.yaml                # 全局统一配置文件 (数据、训练、导出、推理)
+├── main.py                    # 统一工作流终端控制台入口
+├── pyproject.toml             # uv 项目依赖配置 (支持跨平台 Torch 安装)
+├── src/                       # 核心源码目录
+│   ├── data_process/          # 数据流转: 异常清洗、类别均衡、数据集划分、抽样可视化
+│   ├── training/              # 模型训练: 网络构建、复合损失、数据增强、Dataloader
+│   ├── demo/                  # 实时推理: Detector 封装、多尺度解码、NMS、相机流接入
+│   └── tools/                 # 实用工具链
+│       ├── background.py      # 室内背景数据集自动下载与分辨率过滤
+│       ├── extract_ros2_bag.py# ROS2 rosbag 自动化解析与图片/标签同步提取
+│       ├── scaler.py          # 像素尺寸辅助测量工具 (调参辅助)
+│       └── get_env.py         # CUDA 环境检测脚本
+```
+
+---
+
+## 🛠️ 环境配置
+
+本项目推荐使用 [uv](https://github.com/astral-sh/uv) 作为极速包管理器，支持 Python 3.11。项目已配置好跨平台依赖逻辑，在 Windows 下会自动拉取最新的 cu128 预览版 PyTorch。
 
 ```bash
 # 1. 安装 uv (如果尚未安装)
 pip install uv
 
-# 2. 同步项目依赖 (将根据当前系统自动注入对应的 PyTorch 版本)
+# 2. 同步并安装所有依赖
 uv sync
 
 # 3. 激活虚拟环境
-source .venv/bin/activate  # Linux/macOS
-# 或者在 Windows 上: .venv\Scripts\activate
+# Windows:
+.venv\Scripts\activate
+# Linux/macOS:
+source .venv/bin/activate
 ```
 
-## 🗂 数据集流转全景
+---
 
-数据集处理严格按照阶段在 `data/` 目录下流转，由 `src/data_process/process.py` (或主菜单) 统一调度：
+## 🚦 快速开始
 
-`raw` -> `purify` -> `balance` -> `datasets` (拆分并执行 `augment`)
-
-### 1. ROS2 Bag 数据采集与提取
-录制数据需包含 `/detector/img_debug` 和 `/detector/armors_debug_info` 话题。
-
-支持 6 种主流目标映射配置：
-- **0**: 蓝方 1号 (B1) | **6**: 红方 1号 (R1)
-- **2**: 蓝方 3号 (B3) | **8**: 红方 3号 (R3)
-- **5**: 蓝方 哨兵 (B7) | **11**: 红方 哨兵 (R7)
-
-**操作步骤：**
-将录制的包放入 `ros2_bag/` 文件夹中，执行：
-```bash
-python tools/extract_ros2_bag.py
-```
-*输出：提取好的原始图片和标签保存在 `data/raw/` 中。*
-
-### 2. 自动化数据处理流水线
-通过主入口进入数据处理模块，或直接运行：
-```bash
-python main.py
-# 选择 [1] 数据预处理
-```
-按顺序将执行以下步骤：
-1. **Purify (清洗)**：过滤空标签、解析错误标签，并利用距离阈值剔除冗余高频相似帧。
-2. **Balance (均衡)**：对数量过多的类别进行下采样（可在 `config.yaml` 配置上限），并移除标签中的 `color` 字段。
-3. **Split (拆分)**：按比例（默认 8:2）拆分 `train` 和 `val` 验证集，生成标准的 `dataset.yaml`，并插入目标可见度标志 `vis=2`。
-4. **Augment (增强)**：**仅针对训练集**进行光学、几何、遮挡和背景替换增强，严格保护验证集纯度。
-
-#### 🏷 标签格式演变
-- **Raw 阶段 (10列)**: `class_id color x1 y1 x2 y2 x3 y3 x4 y4`
-- **训练阶段 (10列)**: `class_id vis x1 y1 x2 y2 x3 y3 x4 y4` 
-  *(其中 `vis` 为可见度：0=不可见/严重遮挡, 1=部分遮挡, 2=完全可见)*
-
-## 🚀 模型训练
-
-所有的超参数、数据路径和损失权重均在 `config.yaml` 的 `kielas_rm_train` 节点下配置。
-
-```bash
-# 启动训练
-python main.py
-# 选择 [2] 开启模型训练
-```
-
-**训练特性：**
-- 动态 DataLoader，规避多进程内存溢出问题。
-- 自定义损失评估：**PCK@0.5** (Percentage of Correct Keypoints) 为核心验证指标。
-- 支持断点续训与基于 PCK 的自动早停 (Early Stopping)。
-- 训练完成后自动在 `model_res/` 下生成 loss 曲线与验证集预测可视化图。
-
-## 📦 格式导出与轻量化
-
-训练获得最佳权重 (`best_model.pth`) 后，可导出用于 C++ 端或部署框架的格式。
+所有核心功能均已集成至统一终端菜单中。激活环境后，只需运行：
 
 ```bash
 python main.py
-# 选择 [3] 模型格式导出
 ```
-支持导出格式（通过 `config.yaml` 配置）：
-- **ONNX**: 默认 opset 18，内建 `onnxsim` 极致图优化与算子折叠。
-- **TorchScript**: 面向原生 C++ LibTorch 环境。
 
-## 🎥 实时推理演示 (Demo)
+在控制台中，输入对应序号即可执行不同模块的任务：
+1. **数据预处理**：自动处理 `data/raw` 下的原始数据（清洗、均衡、拆分）。
+2. **开启模型训练**：基于 `config.yaml` 设定的超参数启动训练。
+3. **模型格式导出**：将 PyTorch `.pth` 权重导出为部署级 `.onnx`。
+4. **实时推理演示**：调用本地或工业相机，加载模型进行实时目标检测。
 
-验证模型在实际相机流下的识别效果与帧率表现。
+---
 
-```bash
-python main.py
-# 选择 [4] 实时推理演示
-```
-**配置 (`config.yaml` -> `kielas_rm_demo`):**
-- 支持标准 `usb` 摄像头或 `hik` 海康工业相机。
-- 请自行导入和配置hik相机依赖 -> [HikPy](https://github.com/Kielas520/HikPy.git)
-- 支持在运行时通过热键 `W / S` 动态调整相机曝光度。
-- 支持直接加载 `.onnx` 使用 ONNXRuntime 推理，或 `.pt` 加载 TorchScript。
+## ⚙️ 工作流指南
 
-## ⚙️ 配置文件 (config.yaml)
+### 1. 数据准备
+* **ROS2 数据提取**: 如果你的原始数据录制自 ROS2 的 `/detector/img_debug` 和 `/detector/armors_debug_info`，可以直接运行 `src/tools/extract_ros2_bag.py`，程序会自动匹配时间戳并解包为图片与 `.txt` 标签。
+* **背景图片准备**: 运行 `src/tools/background.py` 可自动下载并提取 MIT indoorCVPR_09 数据集，用于训练时的背景随机融合增强。
 
-系统行为由项目根目录的 `config.yaml` 全局控制。主要涵盖：
-- `kielas_rm_train`: 训练批次、学习率调度、Focal Loss 参数、各类数据增强的概率等。
-- `kielas_rm_export`: 导出尺寸、格式和 onnx-simplifier 开关。
-- `kielas_rm_demo`: NMS 阈值、置信度阈值、相机设备选择与初始曝光。
+### 2. 模型训练
+* 训练参数统一在 `config.yaml` 的 `kielas_rm_train` 节点下配置。
+* 内置 **半在线洗牌机制** (`shuffle_interval`)，每隔指定 epoch 会刷新多进程数据增强的随机种子。
+* 支持 **Forward Hook 特征可视化**：训练或验证结束后，会自动导出 Neck 层 (P3, P4, P5) 的特征图与真实推理对比图，辅助排查模型盲区。
+
+### 3. 模型导出与推理
+* **导出模型**: 选择主菜单的 `3` 将模型导出为 ONNX。如果环境中安装了 `onnxsim`，程序会自动对计算图进行极致精简。
+* **推理封装**: `src/demo/detector.py` 提供了一个高层级的 `Detector` 类，内部消化了图像缩放、多尺度 Tensor 解码以及基于物理距离的关键点 NMS。
+* **海康相机支持**: `demo.py` 无缝对接了底层海康相机接口，可在运行中按下 `W/S` 键实时热更新相机的物理曝光值，应对复杂的赛场打光。
+
+---
+
+## 📝 配置说明 (config.yaml)
+
+所有的超参数调整都在 `config.yaml` 中完成，主要包含四个顶级模块：
+
+* `kielas_rm_train.dataset`: 包含数据清洗的距离阈值、类别均衡最大采样数、各项数据增强概率（如 `bloom_prob`, `occ_prob` 等）。
+* `kielas_rm_train.train`: 训练超参数，包括学习率、优化器配置、早停机制 (`early_stopping`) 以及 PCK 与分类精度的评估权重分配。
+* `kielas_rm_export`: 指定导出尺寸、Opset 版本及是否开启化简。
+* `kielas_rm_demo`: 硬件相关的配置，如 `camera_type` ("usb" 或 "hik")、海康相机的初始曝光时间与置信度阈值。
