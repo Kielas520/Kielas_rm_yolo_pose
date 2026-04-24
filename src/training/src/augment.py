@@ -21,8 +21,7 @@ class AugmentConfig:
     hsv_v_gain: float = 0.8
     noise_prob: float = 0.7
     bloom_prob: float = 0.8
-    bloom_prob_area_range: Tuple[float, float] = (0.01, 0.13) 
-
+    
     # --- 几何变换增强 (保留在 CPU) ---
     flip_prob: float = 0.5
     scale_prob: float = 0.9
@@ -315,6 +314,8 @@ class AugmentPipeline:
 if __name__ == "__main__":
     from rich.progress import track   
     from rich.console import Console  
+    import shutil
+    import yaml
 
     console = Console()
 
@@ -330,13 +331,25 @@ if __name__ == "__main__":
                     parsed.append({'class_id': parts[0], 'vis': visibility, 'pts': pts})
         return parsed
         
-    cfg = AugmentConfig()
+    # 读取配置文件中的参数
+    config_file = Path("./config.yaml")
+    if config_file.exists():
+        with open(config_file, 'r', encoding='utf-8') as f:
+            cfg_data = yaml.safe_load(f)
+            # 根据你的 train.py 层级结构读取 augment 配置
+            aug_cfg_dict = cfg_data.get('kielas_rm_train', {}).get('dataset', {}).get('augment', {})
+            cfg = AugmentConfig(**aug_cfg_dict)
+            console.print("[green]成功加载 config.yaml 中的增强参数[/green]")
+    else:
+        cfg = AugmentConfig()
+        console.print("[yellow]未找到 config.yaml，使用默认增强参数[/yellow]")
+
     pipeline = AugmentPipeline(cfg)
     
     bg_dir = Path(cfg.bg_dir)
     bg_paths = list(bg_dir.glob("*.jpg")) + list(bg_dir.glob("*.png")) if bg_dir.exists() else []
 
-    # 极限测试参数
+    # 仅将所有概率强制拉满进行极限测试，保留配置中的 range 和 factor 等设定
     pipeline.cfg.blur_prob = 1.0
     pipeline.cfg.hsv_prob = 1.0
     pipeline.cfg.noise_prob = 1.0
@@ -349,7 +362,6 @@ if __name__ == "__main__":
     pipeline.cfg.bg_replace_prob = 1.0
     pipeline.cfg.occ_prob = 1.0
     pipeline.cfg.brightness_prob = 1.0
-    pipeline.cfg.brightness_range = (0.8, 1.5)  
 
     dataset_dir = Path("./data/balance")
     train_images = list((dataset_dir / "2" / "photos").glob("*.jpg"))
@@ -357,7 +369,11 @@ if __name__ == "__main__":
     test_samples = random.sample(train_images, min(3, len(train_images))) if train_images else []
     
     out_dir = Path("./data/test/augment")
-    out_dir.mkdir(parents=True, exist_ok=True)
+    
+    # 检查并强制清空旧目录
+    if out_dir.exists():
+        shutil.rmtree(out_dir)
+    out_dir.mkdir(parents=True)
     
     console.print(f"[bold cyan]提取了 {len(test_samples)} 张图片准备测试流水线...[/bold cyan]")
     
