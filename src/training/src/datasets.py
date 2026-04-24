@@ -19,8 +19,6 @@ console = Console()
 cv2.setNumThreads(0)
 cv2.ocl.setUseOpenCL(False)
 
-# 注意：这里去掉了旧的 from src.training.src.augment import process_data
-
 # ---------------------------------------------------------
 # 1. 目标编码逻辑 (保持不变)
 # ---------------------------------------------------------
@@ -86,7 +84,6 @@ class RMArmorDataset(Dataset):
     def __init__(self, img_dir, label_dir, class_id, input_size=(416, 416), strides=[8, 16, 32], 
                  scale_ranges=[[0, 64], [32, 128], [96, 9999]], transform=None, data_name='', 
                  aug_pipeline=None, bg_dir=None, shared_stage=None, processed_counter=None): 
-        # ▲ 注意：上面将 augment_cfg 替换为了 aug_pipeline
         
         self.img_dir = img_dir
         self.label_dir = label_dir
@@ -99,7 +96,16 @@ class RMArmorDataset(Dataset):
         self.scale_ranges = torch.tensor(scale_ranges, dtype=torch.float32)
         self.grid_sizes = [(input_size[0] // s, input_size[1] // s) for s in strides]
         
+        # 获取所有样本名
         self.samples = [f.split('.')[0] for f in os.listdir(label_dir) if f.endswith('.txt')]
+        
+        # =====================================================================
+        # 核心修复：全局洗牌打断文件系统的物理排序，避免类别聚集引发灾难性遗忘
+        # =====================================================================
+        random.seed(42)  # 设定固定种子，确保多进程或重复初始化时序列打乱的一致性
+        random.shuffle(self.samples)
+        # =====================================================================
+
         self.shared_stage = shared_stage
         self.processed_counter = processed_counter 
         
