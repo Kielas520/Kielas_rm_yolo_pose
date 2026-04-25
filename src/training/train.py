@@ -426,7 +426,8 @@ def main():
             aug_pipeline=aug_pipeline,
             bg_dir=bg_dir_str,           
             shared_stage=shared_stage,
-            processed_counter=processed_counter 
+            processed_counter=processed_counter,
+            negative_class_id=negative_class_id 
         ),
         batch_size=train_cfg['batch_size'],
         shuffle=True,
@@ -444,7 +445,8 @@ def main():
             input_size=input_size, 
             strides=strides,
             scale_ranges=scale_ranges, 
-            data_name='val'
+            data_name='val',
+            negative_class_id=negative_class_id
         ),
         batch_size=train_cfg['batch_size'], 
         shuffle=False, 
@@ -529,77 +531,81 @@ def main():
             f"[bold green]Overall Training | Stage 0 | Next Shuffle: {shuffle_interval} epochs", 
             total=epochs
         )
-        
-        for epoch in range(1, epochs + 1):
-            if epoch > 1 and (epoch - 1) % shuffle_interval == 0:
-                with shared_stage.get_lock():
-                    shared_stage.value += 1
-                console.print(f"\n[bold yellow]🔄 触发半在线洗牌机制！目前进入 Stage {shared_stage.value}[/bold yellow]")
-            
-            next_shuffle_in = shuffle_interval - ((epoch - 1) % shuffle_interval)
-            
-            progress.update(
-                epoch_task, 
-                description=f"[bold green]Overall Training | Stage {shared_stage.value} | Next Shuffle: {next_shuffle_in} epochs"
-            )
-            
-            epoch_losses = train_one_epoch(
-                model, train_loader, optimizer, criterion, device, 
-                epoch, progress, scaler, shared_stage.value,
-                processed_counter=processed_counter,            
-                batch_size=train_cfg['batch_size'],             
-                total_samples=len(train_loader.dataset),
-                aug_pipeline=aug_pipeline                       
-            )
-            
-            # 【修复 5】：传递给验证集过程
-            val_loss, val_pck, val_id_acc = validate(
-                model, val_loader, criterion, device, epoch, progress, 
-                input_size, strides, reg_max, conf_thresh, kpt_dist_thresh, pck_cfg, num_classes
-            )
-            
-            if epoch <= warmup_epochs:
-                current_lr = base_lr * (epoch / warmup_epochs)
-                for param_group in optimizer.param_groups:
-                    param_group['lr'] = current_lr
-            else:
-                scheduler.step()
-                current_lr = optimizer.param_groups[0]['lr']
+        # ==================== 【修改开始】 ====================
+        try:
+            for epoch in range(1, epochs + 1):
+                if epoch > 1 and (epoch - 1) % shuffle_interval == 0:
+                    with shared_stage.get_lock():
+                        shared_stage.value += 1
+                    console.print(f"\n[bold yellow]🔄 触发半在线洗牌机制！目前进入 Stage {shared_stage.value}[/bold yellow]")
+                
+                next_shuffle_in = shuffle_interval - ((epoch - 1) % shuffle_interval)
+                
+                progress.update(
+                    epoch_task, 
+                    description=f"[bold green]Overall Training | Stage {shared_stage.value} | Next Shuffle: {next_shuffle_in} epochs"
+                )
+                
+                epoch_losses = train_one_epoch(
+                    model, train_loader, optimizer, criterion, device, 
+                    epoch, progress, scaler, shared_stage.value,
+                    processed_counter=processed_counter,            
+                    batch_size=train_cfg['batch_size'],             
+                    total_samples=len(train_loader.dataset),
+                    aug_pipeline=aug_pipeline                       
+                )
+                
+                # 【修复 5】：传递给验证集过程
+                val_loss, val_pck, val_id_acc = validate(
+                    model, val_loader, criterion, device, epoch, progress, 
+                    input_size, strides, reg_max, conf_thresh, kpt_dist_thresh, pck_cfg, num_classes
+                )
+                
+                if epoch <= warmup_epochs:
+                    current_lr = base_lr * (epoch / warmup_epochs)
+                    for param_group in optimizer.param_groups:
+                        param_group['lr'] = current_lr
+                else:
+                    scheduler.step()
+                    current_lr = optimizer.param_groups[0]['lr']
 
-            val_score = (w_pck * val_pck) + (w_id * val_id_acc)
+                val_score = (w_pck * val_pck) + (w_id * val_id_acc)
 
-            history['train_total'].append(epoch_losses['total_loss'])
-            history['train_pose'].append(epoch_losses['loss_pose'])
-            history['train_cls'].append(epoch_losses['loss_cls'])
-            history['val_pck'].append(val_pck)
-            history['val_id_acc'].append(val_id_acc)
-            history['val_score'].append(val_score)
-            history['lr'].append(current_lr)
-            
-            console.print(
-                f"[bold cyan]Epoch {epoch}/{epochs}[/bold cyan] | "
-                f"Train Total: {epoch_losses['total_loss']:.4f} | "
-                f"Pose: {epoch_losses['loss_pose']:.4f} | "
-                f"Cls: {epoch_losses['loss_cls']:.4f}"
-            )
-            console.print(
-                f"             [bold magenta]↳[/bold magenta] LR: {current_lr:.6f} | "
-                f"Val PCK: {val_pck:.4f} | "
-                f"Val ID Acc: {val_id_acc:.4f} | "
-                f"Val Score: {val_score:.4f}"
-            )
-            
-            if val_score > best_val_score:
-                best_val_score = val_score
-                torch.save(model.state_dict(), save_dir / "best_model.pth")
-                console.print(f"[green]  -> 发现更高综合得分: {val_score:.4f}，模型已保存。[/green]")
-            
-            progress.update(epoch_task, advance=1)
-            
-            if auto_stop_enabled and val_score >= min_score:
-                console.print(f"\n[bold yellow]验证集综合得分 ({val_score:.4f}) 已达到设定的停止阈值，提前终止训练。[/bold yellow]")
-                break
-
+                history['train_total'].append(epoch_losses['total_loss'])
+                history['train_pose'].append(epoch_losses['loss_pose'])
+                history['train_cls'].append(epoch_losses['loss_cls'])
+                history['val_pck'].append(val_pck)
+                history['val_id_acc'].append(val_id_acc)
+                history['val_score'].append(val_score)
+                history['lr'].append(current_lr)
+                
+                console.print(
+                    f"[bold cyan]Epoch {epoch}/{epochs}[/bold cyan] | "
+                    f"Train Total: {epoch_losses['total_loss']:.4f} | "
+                    f"Pose: {epoch_losses['loss_pose']:.4f} | "
+                    f"Cls: {epoch_losses['loss_cls']:.4f}"
+                )
+                console.print(
+                    f"             [bold magenta]↳[/bold magenta] LR: {current_lr:.6f} | "
+                    f"Val PCK: {val_pck:.4f} | "
+                    f"Val ID Acc: {val_id_acc:.4f} | "
+                    f"Val Score: {val_score:.4f}"
+                )
+                
+                if val_score > best_val_score:
+                    best_val_score = val_score
+                    torch.save(model.state_dict(), save_dir / "best_model.pth")
+                    console.print(f"[green]  -> 发现更高综合得分: {val_score:.4f}，模型已保存。[/green]")
+                
+                progress.update(epoch_task, advance=1)
+                
+                if auto_stop_enabled and val_score >= min_score:
+                    console.print(f"\n[bold yellow]验证集综合得分 ({val_score:.4f}) 已达到设定的停止阈值，提前终止训练。[/bold yellow]")
+                    break
+        except KeyboardInterrupt:
+            # 捕获 Ctrl+C 中断信号
+            console.print("\n[bold red]⚠️ 接收到 Ctrl+C 中断信号！正在退出训练循环并执行保存工作...[/bold red]")
+        # ==================== 【修改结束】 ====================
         torch.save(model.state_dict(), save_dir / "last_model.pth")
         save_training_curves(history, save_dir)
         
@@ -628,12 +634,13 @@ def main():
             input_size=input_size, strides=strides, data_name='vis_train',
             aug_pipeline=aug_pipeline,   
             bg_dir=bg_dir_str,           
-            shared_stage=shared_stage    
+            shared_stage=shared_stage,
+            negative_class_id=negative_class_id    
         )
         
         vis_val_dataset = RMArmorDataset(
             data_cfg['val_img_dir'], data_cfg['val_label_dir'], data_cfg['class_id'],
-            input_size=input_size, strides=strides, data_name='vis_val'
+            input_size=input_size, strides=strides, data_name='vis_val', negative_class_id=negative_class_id
         )
 
         vis_train_loader = DataLoader(vis_train_dataset, batch_size=1, shuffle=True, num_workers=0)

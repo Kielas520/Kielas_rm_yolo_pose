@@ -18,7 +18,7 @@ from rich.progress import (
     TimeRemainingColumn,
 )
 from rich.panel import Panel
-from rich.prompt import Confirm  # 用于交互确认
+from rich.prompt import Confirm
 
 console = Console()
 
@@ -41,33 +41,42 @@ class DownloadConfig:
     })
 
 def sync_with_yaml(config: DownloadConfig, yaml_path: str = "config.yaml"):
-    """从 YAML 中读取配置并覆盖默认参数"""
+    """从 YAML 中读取配置并根据 type 覆盖默认参数"""
     try:
         if not Path(yaml_path).exists():
+            console.print(f"[yellow]未找到 {yaml_path}，使用默认配置。[/yellow]")
             return
             
         with open(yaml_path, 'r', encoding='utf-8') as f:
             data = yaml.safe_load(f)
-            root_cfg = data.get('kielas_rm_train', {}).get('tools', {})
             
-            # 1. 读取下载专用配置
-            bg_info = root_cfg.get('background', {})
-            if bg_info:
-                config.url = bg_info.get('url', config.url)
-                config.tar_file_name = bg_info.get('tar_name', config.tar_file_name)
-                config.limit = bg_info.get('limit', config.limit)
-                config.max_resolution = bg_info.get('max_res', config.max_resolution)
-                config.min_resolution = bg_info.get('min_res', config.min_resolution)
-                config.use_proxy = bg_info.get('use_proxy', config.use_proxy)
-                config.proxies = bg_info.get('proxies', config.proxies)
-
-            # 2. 读取路径配置
-            aug_cfg = root_cfg.get('augment', {})
-            config.base_path = aug_cfg.get('bg_dir', config.base_path)
+            # 定位到 downloader 配置层级
+            dl_cfg = data.get('kielas_rm_train', {}).get('downloader', {})
+            if not dl_cfg:
+                console.print("[yellow]YAML 中未找到 downloader 配置，使用默认值。[/yellow]")
+                return
+                
+            # 获取下载类型 (默认为 background)
+            dl_type = dl_cfg.get('type', 'background')
+            console.print(f"[cyan]检测到下载任务类型: {dl_type}[/cyan]")
             
-            console.print(f"[green]成功从 {yaml_path} 加载配置[/green]")
+            # 获取对应类型的具体配置项
+            target_cfg = dl_cfg.get(dl_type, {})
+            
+            if target_cfg:
+                config.url = target_cfg.get('url', config.url)
+                config.tar_file_name = target_cfg.get('tar_name', config.tar_file_name)
+                config.limit = target_cfg.get('limit', config.limit)
+                config.max_resolution = target_cfg.get('max_res', config.max_resolution)
+                config.min_resolution = target_cfg.get('min_res', config.min_resolution)
+                config.use_proxy = target_cfg.get('use_proxy', config.use_proxy)
+                config.proxies = target_cfg.get('proxies', config.proxies)
+                # 将 YAML 中的 output_dir 映射到内部的 base_path
+                config.base_path = target_cfg.get('output_dir', config.base_path)
+            
+            console.print(f"[green]成功从 {yaml_path} 加载 [{dl_type}] 的配置[/green]")
     except Exception as e:
-        console.print(f"[yellow]加载 {yaml_path} 失败，使用内置默认值。错误: {e}[/yellow]")
+        console.print(f"[red]加载 {yaml_path} 失败，使用内置默认值。错误: {e}[/red]")
 
 def download_and_extract(config: DownloadConfig):
     root = Path(config.base_path).resolve()
@@ -100,29 +109,36 @@ def download_and_extract(config: DownloadConfig):
     if not root.exists():
         root.mkdir(parents=True, exist_ok=True)
 
-    # 下载逻辑
+    # 下载逻辑 (包含断点续传)
     if not flag_file.exists():
         headers = {}
         resume_byte = tar_path.stat().st_size if tar_path.exists() else 0
         if resume_byte > 0:
             headers['Range'] = f'bytes={resume_byte}-'
-            console.print(f"[yellow]续传模式：从 {resume_byte / 1024**2:.2f} MB 开始...[/yellow]")
+            console.print(f"[yellow]续传模式：检测到本地已下载文件，从 {resume_byte / 1024**2:.2f} MB 开始断点续传...[/yellow]")
 
         try:
-            if config.use_proxy:
-                response = requests.get(config.url, headers=headers, stream=True, timeout=30, proxies=config.proxies)
-            else:
-                response = requests.get(config.url, headers=headers, stream=True, timeout=30)
-            # 如果服务器不支持 Range 或文件已改变，重置下载
+            req_kwargs = {"headers": headers, "stream": True, "timeout": 30}
+            if config.use_proxy and config.proxies:
+                req_kwargs["proxies"] = config.proxies
+
+            response = requests.get(config.url, **req_kwargs)
+            
+            # 状态码处理逻辑
             if response.status_code == 200:
+                # 服务器不支持 Range 或请求被忽略，从头开始
                 resume_byte = 0
                 mode = 'wb'
             elif response.status_code == 206:
+                # 成功返回部分内容，追加写入
                 mode = 'ab'
-            elif response.status_code == 416: # Range 不符合要求
+            elif response.status_code == 416: 
+                # Range 不符合要求 (如文件已完整)，重置下载
                 resume_byte = 0
                 mode = 'wb'
-                response = requests.get(config.url, stream=True, timeout=30, proxies=config.proxies)
+                if "headers" in req_kwargs:
+                    del req_kwargs["headers"]
+                response = requests.get(config.url, **req_kwargs)
             else:
                 console.print(f"[bold red]下载失败，状态码: {response.status_code}[/bold red]")
                 return
@@ -194,7 +210,7 @@ def download_and_extract(config: DownloadConfig):
         if tar_path.exists(): 
             tar_path.unlink()
             
-        console.print(Panel(f"[bold green]任务完成！[/bold green]\n共计: {extracted_count} 张\n路径: {root}"))
+        console.print(Panel(f"[bold green]任务完成！[/bold green]\n共计: {extracted_count} 张\n输出路径: {root}"))
         
     except Exception as e:
         console.print(f"[bold red]处理出错:[/bold red] {e}")
@@ -203,7 +219,7 @@ if __name__ == "__main__":
     # 初始化默认配置
     cfg = DownloadConfig()
     
-    # 自动从 yaml 覆盖配置
+    # 自动从 yaml 根据 type 读取并覆盖配置
     sync_with_yaml(cfg, "config.yaml")
     
     # 执行下载与提取

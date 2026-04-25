@@ -1,6 +1,7 @@
 kielas_rm_train:
   
   sampler:
+    max_num_classes: 13
     video_path: "D:\\Download\\negative.mp4"
     export_dir: "./data/purify"
     frame_step: 5  # 每隔多少帧抽取一次
@@ -111,6 +112,8 @@ kielas_rm_train:
       min_score: 0.98        
 
   tools:
+    type: 'negative'
+
     background:
       url: "http://groups.csail.mit.edu/vision/LabelMe/NewImages/indoorCVPR_09.tar"
       tar_name: "indoorCVPR_09.tar"
@@ -121,6 +124,19 @@ kielas_rm_train:
       proxies:
         http: "http://127.0.0.1:7897"
         https: "http://127.0.0.1:7897"
+      output_dir: './background'
+    
+    negative:
+      url: "http://groups.csail.mit.edu/vision/LabelMe/NewImages/indoorCVPR_09.tar"
+      tar_name: "indoorCVPR_09.tar"
+      limit: 5000
+      max_res: 1280
+      min_res: 320
+      use_proxy: false
+      proxies:
+        http: "http://127.0.0.1:7897"
+        https: "http://127.0.0.1:7897"
+      output_dir: './negative'
 
 kielas_rm_export:
   weights: "./model_res/best_model.pth"

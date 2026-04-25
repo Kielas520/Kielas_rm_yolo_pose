@@ -39,16 +39,18 @@ def save_annotation(export_dir: Path, frame, class_id: int, points: list, img_id
     label_dir.mkdir(parents=True, exist_ok=True)
     
     # 保存格式: class_id l_down_x l_down_y l_up_x l_up_y r_down_x r_down_y r_up_x r_up_y
-    # pts 顺序: 左下, 左上, 右下, 右上
     pts_flat = [coord for pt in points for coord in pt]
     line = f"{class_id} " + " ".join([f"{x:.1f}" for x in pts_flat]) + "\n"
     
+    # 格式化为 5 位数字序号，如 00000, 00001
+    file_name = f"{img_idx:05d}"
+    
     # 保存
-    cv2.imwrite(str(photo_dir / f"{img_idx}.jpg"), frame)
-    with open(label_dir / f"{img_idx}.txt", 'w', encoding='utf-8') as f:
+    cv2.imwrite(str(photo_dir / f"{file_name}.jpg"), frame)
+    with open(label_dir / f"{file_name}.txt", 'w', encoding='utf-8') as f:
         f.write(line)
 
-def annotate_frame(frame, current_class_id):
+def annotate_frame(frame, current_class_id, max_num_classes):
     """进入单帧的标定界面"""
     points = []
     clone = frame.copy()
@@ -89,7 +91,7 @@ def annotate_frame(frame, current_class_id):
         cv2.putText(display, data_str.strip(), (10, h - 20), 
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
-        # 3. 绘制顶部操作提示 (更新了按键提示)
+        # 3. 绘制顶部操作提示
         cv2.putText(display, f"Class ID: {current_class_id} (0-9 to set, W/S to +/-)", 
                     (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
         cv2.putText(display, "Left Click: Add Point | Right Click: Undo | C: Clear", 
@@ -110,12 +112,12 @@ def annotate_frame(frame, current_class_id):
             else:
                 print("请点满 4 个角点 (左下，左上，右下，右上) 再保存！")
         
-        # --- 新增和修改的 ID 切换逻辑 ---
+        # ID 切换逻辑 (根据 max_num_classes 限制上限)
         elif ord('0') <= key <= ord('9'):  
             current_class_id = int(chr(key))
-        elif key == ord('w') or key == ord('+') or key == ord('='):  # W 键递增
-            current_class_id = min(12, current_class_id + 1)
-        elif key == ord('s') or key == ord('-'):                     # S 键递减
+        elif key == ord('w') or key == ord('+') or key == ord('='):  
+            current_class_id = min(max_num_classes - 1, current_class_id + 1)
+        elif key == ord('s') or key == ord('-'):                     
             current_class_id = max(0, current_class_id - 1)
 
 def main():
@@ -128,6 +130,7 @@ def main():
     video_path = Path(cfg.get('video_path', ''))
     export_dir = Path(cfg.get('export_dir', './export'))
     frame_step = cfg.get('frame_step', 5)
+    max_num_classes = cfg.get('max_num_classes', 13) # 获取最大类别数，默认为 13
 
     if not video_path.exists():
         print(f"错误: 找不到视频文件 {video_path}")
@@ -141,14 +144,24 @@ def main():
     current_class_id = 0
     class_indices = {} 
     
-    frame_count = 0
-    window_main = "Video Frame (A: Annotate, D/Space: Skip, Q: Quit)"
-    cv2.namedWindow(window_main)
-
     print("--- 启动采样程序 ---")
+    
+    # 启动时主动检索输出目录，根据 max_num_classes 加载所有可能 ID 的已有进度
+    print(f"[*] 正在检索已有标定数据 (共检索 0-{max_num_classes - 1} 类)...")
+    for cls_id in range(max_num_classes):
+        next_idx = get_next_index(export_dir, cls_id)
+        class_indices[cls_id] = next_idx
+        if next_idx > 0:
+            print(f" -> 类别 {cls_id:<2}: 已发现 {next_idx} 张样本，将从序号 {next_idx:05d} 开始追加")
+            
+    print("--------------------")
     print("A 键：对当前帧进行标定")
     print("D 或 空格键：跳过当前帧")
     print("Q 键：退出程序")
+
+    frame_count = 0
+    window_main = "Video Frame (A: Annotate, D/Space: Skip, Q: Quit)"
+    cv2.namedWindow(window_main)
 
     while True:
         ret, frame = cap.read()
@@ -174,16 +187,16 @@ def main():
                 return
             elif key == ord('d') or key == 32:  # Skip
                 break
-            elif key == ord('a'):  # Annotate
-                saved, current_class_id, points = annotate_frame(frame, current_class_id)
+            elif key == ord('a'):  # Annotate (传入 max_num_classes)
+                saved, current_class_id, points = annotate_frame(frame, current_class_id, max_num_classes)
                 if saved:
-                    if current_class_id not in class_indices:
-                        class_indices[current_class_id] = get_next_index(export_dir, current_class_id)
-                    
+                    # 获取当前分配好的序号并保存
                     img_idx = class_indices[current_class_id]
                     save_annotation(export_dir, frame, current_class_id, points, img_idx)
                     
-                    print(f"[*] 已保存类别 {current_class_id} 的样本，索引为 {img_idx}")
+                    print(f"[*] 已保存类别 {current_class_id} 的样本，保存为 {img_idx:05d}.jpg/txt")
+                    
+                    # 序号自增，为下一张图做准备
                     class_indices[current_class_id] += 1
                 break
 

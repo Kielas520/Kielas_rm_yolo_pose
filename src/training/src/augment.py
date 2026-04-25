@@ -114,8 +114,13 @@ class AugmentPipeline:
     # =========================================================================
     # 供 datasets.py 在 DataLoader 的子进程中调用 (CPU 环境)
     # =========================================================================
-    def process_cpu(self, img, labels, bg_paths: list = None):
+    def process_cpu(self, img, labels, bg_paths: list = None, is_pure_negative: bool = False):
         """执行所有几何形变、遮挡和背景融合"""
+        
+        if is_pure_negative:
+            # 如果是纯负样本图/纯背景图，直接跳过所有几何与背景变换
+            return img.copy(), copy.deepcopy(labels)
+        
         aug_img = img.copy()
         aug_labels = copy.deepcopy(labels)
         h_orig, w_orig = aug_img.shape[:2]

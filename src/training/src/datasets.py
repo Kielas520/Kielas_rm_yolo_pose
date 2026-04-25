@@ -83,7 +83,7 @@ def encode_multi_targets(label_data, img_w=416, img_h=416, grid_w=52, grid_h=52)
 class RMArmorDataset(Dataset):
     def __init__(self, img_dir, label_dir, class_id, input_size=(416, 416), strides=[8, 16, 32], 
                  scale_ranges=[[0, 64], [32, 128], [96, 9999]], transform=None, data_name='', 
-                 aug_pipeline=None, bg_dir=None, shared_stage=None, processed_counter=None): 
+                 aug_pipeline=None, bg_dir=None, shared_stage=None, processed_counter=None, negative_class_id=12): 
         
         self.img_dir = img_dir
         self.label_dir = label_dir
@@ -92,6 +92,7 @@ class RMArmorDataset(Dataset):
         self.transform = transform
         self.class_id = class_id
         self.keep_classes = set(class_id)
+        self.negative_class_id = negative_class_id
         
         self.scale_ranges = torch.tensor(scale_ranges, dtype=torch.float32)
         self.grid_sizes = [(input_size[0] // s, input_size[1] // s) for s in strides]
@@ -139,14 +140,28 @@ class RMArmorDataset(Dataset):
             data = [float(x) for x in parts]
             cls_id = int(data[0])
             
-            if len(data) == 9:
+            # 【修改点 1】：兼容刚才生成的仅有类别 ID 的负样本标签
+            if len(data) == 1:
+                # 设为不可见(vis=0)并填充假坐标。这样既记录了类别，后续网格分配又会自动将其当作纯背景过滤
+                parsed_labels.append({'class_id': cls_id, 'vis': 0, 'pts': np.zeros((4, 2), dtype=np.float32)})
+            elif len(data) == 9:
                 vis = 2
                 pts = np.array(data[1:9], dtype=np.float32).reshape(4, 2)
+                parsed_labels.append({'class_id': cls_id, 'vis': vis, 'pts': pts})
             else:
                 vis = int(data[1])
                 pts = np.array(data[2:10], dtype=np.float32).reshape(4, 2)
-                
-            parsed_labels.append({'class_id': cls_id, 'vis': vis, 'pts': pts})
+                parsed_labels.append({'class_id': cls_id, 'vis': vis, 'pts': pts})
+
+        # 【修改点 2】：判断是否为纯负样本图（没有任何有效正样本）
+        is_pure_negative = True
+        for lbl in parsed_labels:
+            if lbl['class_id'] != self.negative_class_id:
+                is_pure_negative = False
+                break
+        # 如果空标签图，也当作纯背景处理
+        if not parsed_labels:
+            is_pure_negative = True
 
         # ================= 2. 半在线随机洗牌机制 & 动态读图 =================
         current_stage = self.shared_stage.value if self.shared_stage is not None else 0
@@ -165,8 +180,8 @@ class RMArmorDataset(Dataset):
 
         # ================= 3. 呼叫 CPU 端数据增强 (仅几何运算与背景融合) =================
         if self.aug_pipeline is not None:
-            # 调用管线的 CPU 专用接口
-            aug_img, aug_labels = self.aug_pipeline.process_cpu(img, parsed_labels, self.bg_paths)
+            # 【修改点 3】：传入 is_pure_negative 标志给增强管线
+            aug_img, aug_labels = self.aug_pipeline.process_cpu(img, parsed_labels, self.bg_paths, is_pure_negative)
         else:
             aug_img, aug_labels = img, parsed_labels
 
