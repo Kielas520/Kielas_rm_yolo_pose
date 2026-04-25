@@ -56,7 +56,7 @@ kielas_rm_train:
     negative_class_id: 12
     batch_size: 128
     prefetch_factor: 12         # 预取 批次 ，决定每次从硬盘读取多少数据
-    epochs: 200
+    epochs: 500
     weight_decay: 0.03          # 正则化惩罚力度 （0.01 - 0.05）
     save_dir: "./model_res"
     input_size: [416, 416]
@@ -72,7 +72,7 @@ kielas_rm_train:
       betas: [0.940, 0.999] 
     
     scheduler:
-      T_0: 200                  # 【保持】取消重启机制，直接退火至结束
+      T_0: 400                  # 【保持】取消重启机制，直接退火至结束
       T_mult: 1
     
     post_process:
