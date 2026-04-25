@@ -58,7 +58,7 @@ kielas_rm_train:
       scale_prob: 0.6             
       roi_h_exp: 2.1
       roi_w_exp: 1.1
-      scale_range: [0.0009, 0.1]    
+      scale_range: [0.01, 0.1]    
       rotate_prob: 0.6            
       rotate_range: [-45, 45]     
       translate_prob: 0.5         
@@ -83,7 +83,7 @@ kielas_rm_train:
     negative_class_id: 12
     batch_size: 128
     prefetch_factor: 12         # 预取 批次 ，决定每次从硬盘读取多少数据
-    epochs: 500
+    epochs: 200
     weight_decay: 0.03          # 正则化惩罚力度 （0.01 - 0.05）
     save_dir: "./model_res"
     input_size: [416, 416]
@@ -99,8 +99,8 @@ kielas_rm_train:
       betas: [0.940, 0.999] 
     
     scheduler:
-      T_0: 500                  # 【保持】取消重启机制，直接退火至结束
-      T_mult: 1
+      T_0: 100                  # 【保持】取消重启机制，直接退火至结束
+      T_mult: 2
     
     post_process:
       conf_threshold: 0.5 

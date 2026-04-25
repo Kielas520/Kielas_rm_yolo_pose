@@ -31,15 +31,48 @@ import gc
 # 导入自定义模块
 from src.training.src import *
 
+import math
+from copy import deepcopy
+import torch.nn as nn
+
+class ModelEMA:
+    """模型指数移动平均 (Exponential Moving Average)
+    保持模型权重的滑动平均，能极大程度过滤掉因为激进数据增强带来的 Loss 锯齿波动，
+    从而保存下泛化能力最强的稳定权重。
+    """
+    def __init__(self, model, decay=0.9999, tau=2000, updates=0):
+        # 创建一个与原模型结构相同但没有梯度的 EMA 模型
+        self.ema = deepcopy(model).eval()
+        self.updates = updates
+        # 动态 decay：训练初期 decay 较小，让 EMA 快速跟上模型；后期 decay 趋于设定的 0.9999，保持稳定
+        self.decay = lambda x: decay * (1 - math.exp(-x / tau))
+        for p in self.ema.parameters():
+            p.requires_grad_(False)
+
+    def update(self, model):
+        # 在 optimizer.step() 之后更新 EMA 参数
+        self.updates += 1
+        d = self.decay(self.updates)
+
+        msd = model.state_dict()
+        with torch.no_grad():
+            for k, v in self.ema.state_dict().items():
+                if v.dtype.is_floating_point:
+                    v *= d
+                    v += (1 - d) * msd[k].detach()
+
 console = Console()
 
 class TrainingSessionManager:
     """用于管理训练状态与强制保存的上下文管理器"""
-    def __init__(self, model, save_dir, history, console):
+    def __init__(self, model, ema, optimizer, save_dir, history, console):
         self.model = model
+        self.ema = ema  # 引入 EMA
+        self.optimizer = optimizer # 引入优化器以支持完美续训
         self.save_dir = save_dir
         self.history = history
         self.console = console
+        self.current_epoch = 0 # 将在主循环中更新
 
     def __enter__(self):
         return self
@@ -50,8 +83,18 @@ class TrainingSessionManager:
         elif exc_type is not None:
             self.console.print(f"\n[bold red]❌ 训练因为异常中断: {exc_type.__name__}，正在尝试抢救保存模型...[/bold red]")
 
-        # 无论正常结束、Ctrl+C，还是其他异常，都会执行以下保存逻辑
-        torch.save(self.model.state_dict(), self.save_dir / "last_model.pth")
+        # 【核心修复】：保存为全量 Checkpoint，并使用“原子写入”防止文件损坏
+        ckpt = {
+            'epoch': self.current_epoch,
+            'model_state_dict': self.model.state_dict(),
+            'ema_state_dict': self.ema.ema.state_dict() if self.ema else None,
+            'optimizer_state_dict': self.optimizer.state_dict(),
+        }
+        
+        # 先写 tmp 文件，写完再重命名，杜绝写一半断电导致的损坏
+        tmp_path = self.save_dir / "last_model.pth.tmp"
+        torch.save(ckpt, tmp_path)
+        tmp_path.replace(self.save_dir / "last_model.pth")
         
         # 保存训练曲线和日志
         save_training_curves(self.history, self.save_dir)
@@ -63,11 +106,8 @@ class TrainingSessionManager:
                         f"{self.history['train_pose'][i]:.6f}\t{self.history['train_cls'][i]:.6f}\t{self.history['val_pck'][i]:.6f}\n")
 
         if exc_type is KeyboardInterrupt:
-            # 返回 True 表示抑制该异常，阻止它继续向外抛出
-            # 这样程序不会直接崩溃退出，而是能继续往下走到清理显存和输出可视化图片的阶段
             return True
-            
-        return False # 其他错误则正常抛出堆栈
+        return False
 
 def plot_and_save_curve(data, epochs, title, ylabel, save_path, color='b'):
     """通用单图绘制函数"""
@@ -90,7 +130,7 @@ def save_training_curves(history, save_dir):
     plot_and_save_curve(history['train_cls'], epochs, 'Classification Loss', 'Loss', save_dir / "loss_cls.png", 'brown')
     plot_and_save_curve(history['val_pck'], epochs, 'Validation PCK@0.5', 'PCK', save_dir / "val_pck.png", 'r')
 
-def train_one_epoch(model, dataloader, optimizer, criterion, device, epoch, progress, scaler, current_stage, processed_counter, batch_size, total_samples, aug_pipeline):
+def train_one_epoch(model, ema, dataloader, optimizer, criterion, device, epoch, progress, scaler, current_stage, processed_counter, batch_size, total_samples, aug_pipeline):
     model.train()
     
     epoch_losses = {'loss_pose': 0.0, 'loss_cls': 0.0, 'total_loss': 0.0}
@@ -123,6 +163,10 @@ def train_one_epoch(model, dataloader, optimizer, criterion, device, epoch, prog
         scaler.step(optimizer)
         scaler.update()
         
+        # 【新增】：每次权重更新后，平滑更新 EMA 模型
+        if ema is not None:
+            ema.update(model)
+
         for k in epoch_losses:
             epoch_losses[k] += loss_dict[k]
             
@@ -491,18 +535,11 @@ def main():
         persistent_workers=True if workers > 0 else False
     )
 
-    # 【修复 2】：传递给 RMDetector
+    # 1. 初始化模型与 EMA
     model = RMDetector(reg_max=reg_max, num_classes=num_classes).to(device)
-    
-    if go_on:
-        weight_path = Path(continue_cfg['path'])
-        if weight_path.exists():
-            model.load_state_dict(torch.load(weight_path))
-            console.print(f"[bold green]成功加载历史权重：{weight_path}，继续训练。[/bold green]")
-        else:
-            console.print(f"[bold yellow]警告：指定的历史权重文件 {weight_path} 不存在，将自动从头开始训练。[/bold yellow]")
-            go_on = False
+    ema = ModelEMA(model)
 
+    # 2. 提前解析类别权重并初始化 Loss (因为 Optimizer 需要模型参数，顺序无所谓，但提前拿出来更清晰)
     train_img_path = Path(data_cfg['train_img_dir'])
     dataset_yaml_path = train_img_path.parent.parent / "dataset.yaml"
     class_weights_tensor = None
@@ -512,45 +549,61 @@ def main():
             ds_cfg = yaml.safe_load(f)
             weights_dict = ds_cfg.get('weights', {})
             if weights_dict:
-                # 【修复 3】：从动态 num_classes 获取权重长度，避免越界和忽略
                 weights_list = [1.0] * num_classes
                 for cls_idx, weight in weights_dict.items():
                     if int(cls_idx) < num_classes:
                         weights_list[int(cls_idx)] = float(weight)
-                
                 class_weights_tensor = torch.tensor(weights_list, dtype=torch.float32).to(device)
                 console.print(f"[bold green]已从 {dataset_yaml_path.name} 加载多类别权重: {weights_list}[/bold green]")
     else:
-        console.print(f"[bold yellow]警告：未在 {dataset_yaml_path.parent} 下找到 dataset.yaml，将不使用类别加权。[/bold yellow]")
+        console.print(f"[bold yellow]警告：未找到 dataset.yaml，不使用类别加权。[/bold yellow]")
 
-    # 【修复 4】：传递给 RMDetLoss
     criterion = RMDetLoss(
-        lambda_pose=loss_cfg.get('lambda_pose', 1.5),
-        lambda_cls=loss_cfg.get('lambda_cls', 1.0),
-        alpha=loss_cfg.get('alpha', 0.85),
-        gamma=loss_cfg.get('gamma', 2.0),
-        reg_max=reg_max,
-        omega=loss_cfg.get('omega', 10.0),
-        epsilon=loss_cfg.get('epsilon', 2.0),
-        num_classes=num_classes,
-        class_weights=class_weights_tensor,
-        negative_class_id=negative_class_id
+        lambda_pose=loss_cfg.get('lambda_pose', 1.5), lambda_cls=loss_cfg.get('lambda_cls', 1.0),
+        alpha=loss_cfg.get('alpha', 0.85), gamma=loss_cfg.get('gamma', 2.0), reg_max=reg_max,
+        omega=loss_cfg.get('omega', 10.0), epsilon=loss_cfg.get('epsilon', 2.0),
+        num_classes=num_classes, class_weights=class_weights_tensor, negative_class_id=negative_class_id
     ).to(device)
     
+    # 3. 提前初始化 Optimizer 和 Scheduler（关键：为了后面能 load_state_dict）
     optim_cfg = train_cfg['optimizer']
     base_lr = float(optim_cfg['base_lr'])
     betas = optim_cfg['betas']
-    optimizer = optim.AdamW(
-        model.parameters(), 
-        lr=base_lr, 
-        betas=betas, 
-        weight_decay=float(train_cfg['weight_decay'])
-    )
-
+    optimizer = optim.AdamW(model.parameters(), lr=base_lr, betas=betas, weight_decay=float(train_cfg['weight_decay']))
     warmup_epochs = max(1, int(epochs * 0.05))
     scheduler_cfg = train_cfg['scheduler']
     scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=scheduler_cfg['T_0'], T_mult=scheduler_cfg['T_mult'], eta_min=1e-6)
-    best_val_score = 0.0     
+
+    # 4. 执行续训加载逻辑（闭环）
+    start_epoch = 1  # 默认从第1轮开始
+    if go_on:
+        weight_path = Path(continue_cfg['path'])
+        if weight_path.exists():
+            # 推荐加上 weights_only=False 消除高版本 PyTorch 的安全警告
+            ckpt = torch.load(weight_path, map_location=device, weights_only=False) 
+            if isinstance(ckpt, dict) and 'model_state_dict' in ckpt:
+                model.load_state_dict(ckpt['model_state_dict'])
+                if ckpt.get('ema_state_dict') is not None:
+                    ema.ema.load_state_dict(ckpt['ema_state_dict'])
+                
+                # 【修复核心 1】：接上优化器状态，防止动量丢失
+                if 'optimizer_state_dict' in ckpt:
+                    optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+                
+                # 【修复核心 2】：接上 Epoch 进度，防止学习率和 Stage 洗牌重置
+                if 'epoch' in ckpt:
+                    start_epoch = ckpt['epoch'] + 1 
+                    
+                console.print(f"[bold green]成功加载全量历史状态 (恢复至 Epoch {start_epoch})，继续训练。[/bold green]")
+            else:
+                model.load_state_dict(ckpt)
+                ema = ModelEMA(model) 
+                console.print(f"[bold green]成功加载老版纯权重：{weight_path}，继续训练。[/bold green]")
+        else:
+            console.print(f"[bold yellow]警告：指定的历史权重文件不存在，自动从头开始训练。[/bold yellow]")
+            go_on = False
+
+    best_val_score = 0.0    
 
     console.print("[bold green]开始训练...[/bold green]")
     
@@ -569,9 +622,9 @@ def main():
         )
         
         # ==================== 【修改开始】 ====================
-        # 使用上下文管理器包裹训练流程
-        with TrainingSessionManager(model, save_dir, history, console):
-            for epoch in range(1, epochs + 1):
+        with TrainingSessionManager(model, ema, optimizer, save_dir, history, console) as session:
+            # 【修复核心 3】：应用读取到的 start_epoch
+            for epoch in range(start_epoch, epochs + 1):
                 if epoch > 1 and (epoch - 1) % shuffle_interval == 0:
                     with shared_stage.get_lock():
                         shared_stage.value += 1
@@ -584,8 +637,9 @@ def main():
                     description=f"[bold green]Overall Training | Stage {shared_stage.value} | Next Shuffle: {next_shuffle_in} epochs"
                 )
                 
+                # 传入 ema
                 epoch_losses = train_one_epoch(
-                    model, train_loader, optimizer, criterion, device, 
+                    model, ema, train_loader, optimizer, criterion, device, 
                     epoch, progress, scaler, shared_stage.value,
                     processed_counter=processed_counter,            
                     batch_size=train_cfg['batch_size'],             
@@ -593,8 +647,9 @@ def main():
                     aug_pipeline=aug_pipeline                       
                 )
                 
+                # 【关键修改 1】：验证时不再用 model，而是用 ema.ema！
                 val_loss, val_pck, val_id_acc = validate(
-                    model, val_loader, criterion, device, epoch, progress, 
+                    ema.ema, val_loader, criterion, device, epoch, progress, 
                     input_size, strides, reg_max, conf_thresh, kpt_dist_thresh, pck_cfg, num_classes
                 )
                 
@@ -631,10 +686,10 @@ def main():
                 
                 if val_score > best_val_score:
                     best_val_score = val_score
-                    torch.save(model.state_dict(), save_dir / "best_model.pth")
-                    console.print(f"[green]  -> 发现更高综合得分: {val_score:.4f}，模型已保存。[/green]")
+                    # 【关键修改 2】：此时保存的是泛化最好的 EMA 权重，而不是抖动的实时权重
+                    torch.save(ema.ema.state_dict(), save_dir / "best_model.pth")
+                    console.print(f"[green]  -> 发现更高综合得分: {val_score:.4f}，稳健 EMA 模型已保存。[/green]")
                 
-                # 新增：每个 Epoch 结束后实时更新本地保存的曲线图片
                 save_training_curves(history, save_dir)
                 progress.update(epoch_task, advance=1)
                 
@@ -651,14 +706,18 @@ def main():
         gc.collect()
 
         console.print("\n[bold cyan]正在生成识别效果可视化图片...[/bold cyan]")
-        # ... 下方可视化代码保持不变 ...
 
         best_model_path = save_dir / "best_model.pth"
         if best_model_path.exists():
-            model.load_state_dict(torch.load(best_model_path))
+            model.load_state_dict(torch.load(best_model_path, map_location=device))
         else:
-            console.print("[yellow]警告：未发现最佳模型文件，将使用最后一次迭代的权重进行可视化。[/yellow]")
-            model.load_state_dict(torch.load(save_dir / "last_model.pth", weights_only=True))
+            console.print("[yellow]警告：未发现最佳模型文件，将使用最后一次迭代的 EMA 权重进行可视化。[/yellow]")
+            ckpt = torch.load(save_dir / "last_model.pth", map_location=device)
+            # 兼容抽取字典里的 EMA
+            if isinstance(ckpt, dict) and 'ema_state_dict' in ckpt:
+                model.load_state_dict(ckpt['ema_state_dict'])
+            else:
+                model.load_state_dict(ckpt)
         
         vis_train_dataset = RMArmorDataset(
             data_cfg['train_img_dir'], data_cfg['train_label_dir'], data_cfg['class_id'],
