@@ -2,55 +2,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-def keypoint_nms(pts, scores, dist_thresh=15.0):
-    """
-    基于关键点最小欧氏距离的 NMS
-    pts: [N, 4, 2]
-    scores: [N] (综合分类得分)
-    dist_thresh: 判定为共享灯条/角点的最小像素距离阈值
-    """
-    if pts.numel() == 0:
-        return torch.empty((0,), dtype=torch.int64, device=pts.device)
-
-    pts = pts.view(-1, 4, 2)
-    # 按得分降序排列
-    sorted_indices = torch.argsort(scores, descending=True)
-    pts = pts[sorted_indices]
-    
-    keep = []
-    suppressed = torch.zeros(len(pts), dtype=torch.bool, device=pts.device)
-
-    for i in range(len(pts)):
-        if suppressed[i]:
-            continue
-        
-        keep.append(sorted_indices[i])
-        
-        if i == len(pts) - 1:
-            break
-            
-        remaining_indices = torch.arange(i + 1, len(pts), device=pts.device)
-        valid_mask = ~suppressed[remaining_indices]
-        valid_indices = remaining_indices[valid_mask]
-        
-        if len(valid_indices) == 0:
-            continue
-
-        pts_i = pts[i]               
-        pts_j = pts[valid_indices]   
-        
-        # 计算两两关键点距离 [M, 4, 4]
-        diff = pts_i.unsqueeze(0).unsqueeze(2) - pts_j.unsqueeze(1) 
-        dists = torch.norm(diff, dim=-1) 
-        
-        # 提取每对装甲板之间的最小关键点距离
-        min_dists = dists.view(len(valid_indices), -1).min(dim=1)[0] 
-        
-        # 如果最小点距小于阈值，说明共享了灯条，触发抑制
-        suppressed[valid_indices[min_dists < dist_thresh]] = True
-
-    return torch.tensor(keep, dtype=torch.int64, device=pts.device)
-
 class ConvBNSiLU(nn.Module):
     """标准的卷积块，支持调整 kernel_size 和 padding"""
     def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1):
@@ -127,7 +78,8 @@ class RMHead(nn.Module):
         self.reg_max = reg_max
         self.num_classes = num_classes
         
-        # 解耦头：分类和回归使用独立的卷积分支
+        # 全卷积输出头 用于将语义转化成输出特征
+        # 解耦头：分类和回归使用独立的卷积分支 
         self.cls_convs = nn.Sequential(
             ConvBNSiLU(in_channels, in_channels, kernel_size=3, padding=1),
             ConvBNSiLU(in_channels, in_channels, kernel_size=3, padding=1)
@@ -221,6 +173,55 @@ class RMDetector(nn.Module):
         ps = self.neck(*feats)
         # 对三个尺度分别预测，返回列表
         return [self.head(p) for p in ps]
+
+def keypoint_nms(pts, scores, dist_thresh=15.0):
+    """
+    基于关键点最小欧氏距离的 NMS
+    pts: [N, 4, 2]
+    scores: [N] (综合分类得分)
+    dist_thresh: 判定为共享灯条/角点的最小像素距离阈值
+    """
+    if pts.numel() == 0:
+        return torch.empty((0,), dtype=torch.int64, device=pts.device)
+
+    pts = pts.view(-1, 4, 2)
+    # 按得分降序排列
+    sorted_indices = torch.argsort(scores, descending=True)
+    pts = pts[sorted_indices]
+    
+    keep = []
+    suppressed = torch.zeros(len(pts), dtype=torch.bool, device=pts.device)
+
+    for i in range(len(pts)):
+        if suppressed[i]:
+            continue
+        
+        keep.append(sorted_indices[i])
+        
+        if i == len(pts) - 1:
+            break
+            
+        remaining_indices = torch.arange(i + 1, len(pts), device=pts.device)
+        valid_mask = ~suppressed[remaining_indices]
+        valid_indices = remaining_indices[valid_mask]
+        
+        if len(valid_indices) == 0:
+            continue
+
+        pts_i = pts[i]               
+        pts_j = pts[valid_indices]   
+        
+        # 计算两两关键点距离 [M, 4, 4]
+        diff = pts_i.unsqueeze(0).unsqueeze(2) - pts_j.unsqueeze(1) 
+        dists = torch.norm(diff, dim=-1) 
+        
+        # 提取每对装甲板之间的最小关键点距离
+        min_dists = dists.view(len(valid_indices), -1).min(dim=1)[0] 
+        
+        # 如果最小点距小于阈值，说明共享了灯条，触发抑制
+        suppressed[valid_indices[min_dists < dist_thresh]] = True
+
+    return torch.tensor(keep, dtype=torch.int64, device=pts.device)
 
 def decode_tensor(tensor, is_pred=True, class_tensor=None, conf_threshold=0.5, kpt_dist_thresh=15.0, grid_size=(52, 52), reg_max=16, img_size=(416, 416), num_classes=12):
     batch_size = tensor.shape[0]
