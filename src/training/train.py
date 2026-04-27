@@ -40,7 +40,7 @@ class ModelEMA:
     保持模型权重的滑动平均，能极大程度过滤掉因为激进数据增强带来的 Loss 锯齿波动，
     从而保存下泛化能力最强的稳定权重。
     """
-    def __init__(self, model, decay=0.99, tau=480, updates=0):
+    def __init__(self, model, decay=0.999, tau=480, updates=0):
         # 创建一个与原模型结构相同但没有梯度的 EMA 模型
         self.ema = deepcopy(model).eval()
         self.updates = updates
@@ -423,6 +423,7 @@ def main():
     
     train_cfg = cfg['train']
     loss_cfg = train_cfg['loss']
+    ema_cfg = train_cfg['ema']
     pck_cfg = train_cfg['pck']
     data_cfg = train_cfg['data']
     post_cfg = train_cfg['post_process']
@@ -538,7 +539,7 @@ def main():
 
     # 1. 初始化模型与 EMA
     model = RMDetector(reg_max=reg_max, num_classes=num_classes).to(device)
-    ema = ModelEMA(model)
+    ema = ModelEMA(model, decay=ema_cfg['decay'], tau=ema_cfg['tau'])
 
     # 2. 提前解析类别权重并初始化 Loss (因为 Optimizer 需要模型参数，顺序无所谓，但提前拿出来更清晰)
     train_img_path = Path(data_cfg['train_img_dir'])

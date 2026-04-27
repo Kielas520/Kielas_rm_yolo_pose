@@ -83,11 +83,11 @@ kielas_rm_train:
     negative_class_id: 12
     batch_size: 128
     prefetch_factor: 12         # 预取 批次 ，决定每次从硬盘读取多少数据
-    epochs: 300
-    weight_decay: 0.03          # 正则化惩罚力度 （0.01 - 0.05）
+    epochs: 200
+    weight_decay: 0.01          # 正则化惩罚力度 （0.01 - 0.05）
     save_dir: "./model_res"
     input_size: [416, 416]
-    strides: [8, 16, 32]        # 缩放比例 in_channels_list=[64, 128, 256]
+    strides: [8, 16, 32]        # 下采样率，这里写上 [p3, p4, p5] 经历了多少下采样步长
     reg_max: 16                 # 关键点分布偏移网格范围参数
 
     continue:
@@ -95,9 +95,13 @@ kielas_rm_train:
 
     shuffle_interval: 5         # 【保持】每 5 轮重新生成一次增强数据，打散数据分布
     optimizer:
-      base_lr: 0.0003           # 【保持】稍低的基础学习率以稳定震荡
+      base_lr: 0.0002           # 【保持】稍低的基础学习率以稳定震荡
       betas: [0.940, 0.999] 
     
+    ema:
+      decay: 0.999 # 滤波滞留率
+      tau: 480 # 预热所需要的steps 训练一批数据就一个step
+
     scheduler:
       T_0: 300                  # 【保持】取消重启机制，直接退火至结束
       T_mult: 1
@@ -113,7 +117,7 @@ kielas_rm_train:
       val_img_dir: "./data/datasets/images/val"
       val_label_dir: "./data/datasets/labels/val"
       num_workers: 16
-      scale_ranges: [[0, 23], [20, 90], [87, 416]]
+      scale_ranges: [[0, 140], [120, 250], [237, 640]]
 
     # --- 损失函数权重 ---
     loss:
