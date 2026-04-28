@@ -443,6 +443,10 @@ def main():
     early_stop_cfg = train_cfg.get('early_stopping', {})
     auto_stop_enabled = early_stop_cfg.get('enabled', False)
     patience = int(early_stop_cfg.get('patience', 60))  # 读取耐心值
+    disable_aug_ratio = float(early_stop_cfg.get('disable_aug_ratio', 0.2))
+    
+    # 比如 patience=75, ratio=0.2，阈值就是 75 - 15 = 60
+    trigger_threshold = patience - int(patience * disable_aug_ratio)
 
     device = torch.device("cuda" if torch.cuda.is_available() and train_cfg['device'] == 'auto' else train_cfg['device'])
     save_dir = Path(train_cfg.get('save_dir', "./model_res"))
@@ -609,6 +613,9 @@ def main():
 
     epochs_without_improvement = 0  # 【新增】：用于记录连续未提升的 Epoch 数量
 
+    # 【新增】：控制最后收敛阶段的变量
+    aug_disabled = False
+
     console.print("[bold green]开始训练...[/bold green]")
     
     with Progress(
@@ -698,12 +705,48 @@ def main():
                 
                 save_training_curves(history, save_dir)
                 progress.update(epoch_task, advance=1)
-                
+
+                # ==================== 【极简自适应微调机制】 ====================
+                # 如果连续未提升轮数达到了阈值（如 60），且增强还没关，就触发脱模
+                if auto_stop_enabled and not aug_disabled and epochs_without_improvement >= trigger_threshold:
+                    finetune_left = patience - epochs_without_improvement
+                    console.print(f"\n[bold yellow]⚠️ 动态收敛触发：已连续 {epochs_without_improvement} 轮未破纪录。剥离数据增强，进入最后 {finetune_left} 轮纯净微调冲刺！[/bold yellow]")
+                    aug_disabled = True
+
+                    # 1. 回收带增强的 DataLoader
+                    del train_loader
+                    gc.collect()
+
+                    # 2. 重新加载纯净 DataLoader
+                    train_loader = DataLoader(
+                        RMArmorDataset(
+                            data_cfg['train_img_dir'], 
+                            data_cfg['train_label_dir'],
+                            data_cfg['class_id'],
+                            input_size=input_size, 
+                            strides=strides,
+                            scale_ranges=scale_ranges, 
+                            data_name='train',
+                            aug_pipeline=None,           # <--- 停掉增强
+                            bg_dir=bg_dir_str,           
+                            shared_stage=shared_stage,
+                            processed_counter=processed_counter,
+                            negative_class_id=negative_class_id 
+                        ),
+                        batch_size=train_cfg['batch_size'],
+                        shuffle=True,
+                        num_workers=workers,
+                        pin_memory=pin_mem,
+                        persistent_workers=True if workers > 0 else False,
+                        prefetch_factor=train_cfg.get('prefetch_factor', 4) if workers > 0 else None
+                    )
+                    aug_pipeline = None
+
+                # ==================== 【原汁原味的早停兜底】 ====================
                 if auto_stop_enabled and epochs_without_improvement >= patience:
-                    console.print(f"\n[bold yellow]🛑 触发早停：模型验证得分已连续 {patience} 个 Epoch 未创出新高，认为已收敛，提前终止训练。[/bold yellow]")
+                    console.print(f"\n[bold yellow]🛑 触发早停：模型得分已连续 {patience} 个 Epoch 未破纪录，彻底收敛，提前终止。[/bold yellow]")
                     break
-                    
-        # ==================== 【修改结束】 ====================
+
                 
         # 此时程序走出 with TrainingSessionManager 块，无论是正常还是中断，该存的已经存了。
         # 接下来正常清理 Dataloader 并执行后续代码
