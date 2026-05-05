@@ -1,171 +1,195 @@
 kielas_rm_train:
+  # ==========================================
+  # 下载器配置：用于自动获取背景图和负样本集
+  # ==========================================
   downloader:
     type: 'negative'
     background:
       url: "http://groups.csail.mit.edu/vision/LabelMe/NewImages/indoorCVPR_09.tar"
       tar_name: "indoorCVPR_09.tar"
-      limit: 5000
-      max_res: 1280
-      min_res: 320
-      use_proxy: false
+      limit: 5000            # 影响：限制下载/解压的图片数量，防止占用过多磁盘空间
+      max_res: 1280          # 影响：长边超过此值的图片会被缩小，节省内存和显存
+      min_res: 320           # 影响：剔除分辨率过低的图片，保证背景质量
+      use_proxy: false       # 影响：是否启用代理（网络环境不佳时开启）
       proxies:
         http: "http://127.0.0.1:7897"
         https: "http://127.0.0.1:7897"
-      output_dir: './background'
+      output_dir: './background' # 背景图存放路径
     negative:
       url: "http://groups.csail.mit.edu/vision/LabelMe/NewImages/indoorCVPR_09.tar"
       tar_name: "indoorCVPR_09.tar"
-      limit: 5000
+      limit: 5000            # 纯负样本（无装甲板图片）的数量限制
       output_dir: "./negative"
       use_proxy: false
       proxies:
         http: "http://127.0.0.1:7897"
         https: "http://127.0.0.1:7897"
   
+  # ==========================================
+  # 负样本处理配置
+  # ==========================================
   negative_data:
     input_dir: './negative'
-    output_dir: "~/autodl-fs/purify"
+    output_dir: "~/autodl-fs/purify" # 影响：清洗后的负样本存放地，用于后续混入训练集压制误检
 
+  # ==========================================
+  # 视频抽帧采样器配置（从实车录像提取负样本）
+  # ==========================================
   sampler:
-    max_num_classes: 13
-    video_path: "D:\\Download\\negative.mp4"
+    max_num_classes: 13      # 类别总数
+    video_path: "D:\\Download\\negative.mp4" # 赛场背景/裁判系统UI等容易误检的录像
     export_dir: "./data/purify"
-    frame_step: 5  # 每隔多少帧抽取一次
+    frame_step: 5            # 影响：每5帧抽取一张。数值越小样本越多，但相似度过高会导致冗余
 
+  # ==========================================
+  # 数据集与数据增强核心配置
+  # ==========================================
   dataset:
-    raw_dir: "./data/raw"      # 确保本地有这个目录
-    purify_dir: "~/autodl-fs/purify" # "./data/purify"
+    raw_dir: "./data/raw"      
+    purify_dir: "~/autodl-fs/purify" 
     balance_dir: "./data/balance"
     datasets_dir: "./data/datasets"
     balance:
-      max_samples_per_class: 3000
+      max_samples_per_class: 3000 # 影响：强制类别平衡，防止模型偏向样本多的类别（如某类装甲板过少会被过采样）
 
     augment:
-      # --- 基础与光学增强 (适度放宽，避免特征完全损毁) ---
-      brightness_prob: 0.8        
-      brightness_range: [0.3, 3.0] # 【修改】回调过曝上限。3.0已足够模拟射灯，4.5会导致彻底白化
-      blur_prob: 0.7              
-      blur_ksize: [3, 5, 7, 9, 11]
-      hsv_prob: 0.4              
-      hsv_h_gain: 0.01           
-      hsv_s_gain: 0.3             
-      hsv_v_gain: 0.3             
-      noise_prob: 0.7             
-      bloom_prob: 0.2              # 【修改】降低光晕概率，过度泛光会严重干扰角点定位
+      # --- 基础与光学增强 ---
+      brightness_prob: 0.8        # 影响：80%概率改变亮度。增强对赛场光照变化的鲁棒性
+      brightness_range: [0.3, 3.0] # 影响：模拟从极暗(0.3)到射灯高光(3.0)的环境，防止彻底白化导致特征丢失
+      blur_prob: 0.7              # 影响：70%概率高斯模糊。模拟镜头失焦或高速运动模糊
+      blur_ksize: [3, 5, 7, 9, 11] # 影响：模糊核大小。包含大核(11)可提升对严重失焦图像的泛化
+      hsv_prob: 0.4               # 影响：40%概率改变色相/饱和度/明度。提升对不同摄像头色彩偏差的适应力
+      hsv_h_gain: 0.01            # 影响：色相偏移幅度。数值较小以防红蓝装甲板颜色特征发生本质反转
+      hsv_s_gain: 0.3             # 影响：饱和度增益。
+      hsv_v_gain: 0.3             # 影响：明度增益。
+      noise_prob: 0.7             # 影响：添加高斯噪声。模拟暗光环境下的传感器底噪
+      bloom_prob: 0.2             # 影响：模拟灯条光晕。20%概率适中，防止角点被泛光过度掩盖导致回归困难
 
-      # --- 几何变换增强 (终极形变模式微调) ---
-      flip_prob: 0.4              
-      scale_prob: 0.6             
-      roi_h_exp: 2.1
-      roi_w_exp: 1.1
-      scale_range: [0.01, 0.1]    
-      rotate_prob: 0.6            
-      rotate_range: [-45, 45]     
-      translate_prob: 0.5         
-      translate_range: 0.6        
-      perspective_prob: 0.5       
-      perspective_factor: 0.20     # 【修改】从 0.30 降至 0.20，防止四个角点交叉产生多边形自相交
+      # --- 几何变换增强 ---
+      flip_prob: 0.4              # 影响：40%概率水平翻转。扩充朝向特征
+      scale_prob: 0.6             # 影响：60%概率进行面积缩放。
+      roi_h_exp: 2.1              # 影响：装甲板灯条向上下扩张的比例，用于生成背景融合的掩码
+      roi_w_exp: 1.1              # 影响：灯条向左右扩张的比例。
+      scale_range: [0.01, 0.1]    # 影响：缩放后目标占全图的面积比例。模拟远距离微小目标
+      rotate_prob: 0.6            # 影响：60%概率旋转。模拟云台侧倾或车辆翻车角度
+      rotate_range: [-45, 45]     # 影响：旋转角度范围。45度可覆盖绝大多数实战姿态
+      translate_prob: 0.5         # 影响：50%概率平移。迫使模型学习非中心目标的特征
+      translate_range: 0.6        # 影响：平移幅度（图像尺寸的60%）
+      perspective_prob: 0.5       # 影响：50%概率透视变换。模拟大角度斜视装甲板的形变
+      perspective_factor: 0.20    # 影响：透视形变强度。0.20既能模拟形变又防止多边形自相交导致标签报废
 
-      # --- 背景替换增强与遮挡 ---
-      bg_replace_prob: 0.85       
+      # --- 背景替换与遮挡 ---
+      bg_replace_prob: 0.85       # 影响：85%概率将装甲板抠出贴到随机背景上，极大地降低对原图背景的过拟合
       bg_dir: "./background"      
-      occ_prob: 0.8               
-      occ_radius_pct: 0.4         
-      occ_size_pct: [0.02, 0.1]  
+      occ_prob: 0.8               # 影响：80%概率在装甲板上生成黑色遮挡块。模拟弹丸、枪管或其他机器人遮挡
+      occ_radius_pct: 0.4         # 影响：遮挡块出现的位置范围
+      occ_size_pct: [0.02, 0.1]   # 影响：遮挡块占全图的大小比例
 
     split:
-      val: 0.2
+      val: 0.2                    # 影响：20%数据用于验证，80%用于训练。标准的划分比例
 
-  # --- 训练超参数 ---
+  # ==========================================
+  # 训练超参数配置
+  # ==========================================
   train:
-    device: "cuda"              # 可选: "auto", "cuda", "cpu"
-    num_classes: 13
-    negative_class_id: 12
-    batch_size: 128
-    prefetch_factor: 12         # 预取 批次 ，决定每次从硬盘读取多少数据
-    epochs: 200
-    weight_decay: 0.01          # 正则化惩罚力度 （0.01 - 0.05）
-    save_dir: "./model_res"
-    input_size: [416, 416]
-    strides: [8, 16, 32]        # 下采样率，这里写上 [p3, p4, p5] 经历了多少下采样步长
-    reg_max: 16                 # 关键点分布偏移网格范围参数
+    device: "cuda"              
+    num_classes: 13             # 影响：网络分类头的输出通道数
+    negative_class_id: 12       # 影响：指定纯负样本/背景的类别ID，计算损失时该类别不参与位姿回归
+    batch_size: 128             # 影响：每次更新权重的样本数。越大梯度越稳定，但对显存要求极高
+    prefetch_factor: 12         # 影响：DataLoader预读取数据的批次数，缓解CPU数据增强跟不上GPU运算的瓶颈
+    epochs: 200                 # 影响：总训练轮数
+    weight_decay: 0.01          # 影响：L2正则化系数。防止模型权重过大导致过拟合
+    save_dir: "./model_res"     # 模型权重和曲线保存路径
+    input_size: [416, 416]      # 影响：网络输入分辨率。416能在算力受限平台上保证极高的推理帧率
+    strides: [8, 16, 32]        # 影响：FPN三个输出特征图相对于输入图像的下采样倍率
+    reg_max: 16                 # 影响：DFL(Distribution Focal Loss)的离散分布范围，决定了关键点回归的最大偏移自由度
 
     continue:
-      path: "./model_res/best_model.pth"
+      path: "./model_res/best_model.pth" # 影响：断点续训时的权重读取路径
 
-    shuffle_interval: 5         # 【保持】每 5 轮重新生成一次增强数据，打散数据分布
+    shuffle_interval: 5         # 影响：每5轮打乱一次数据序列并重新生成随机增强，保持训练数据的多样性
     optimizer:
-      base_lr: 0.0002           # 【保持】稍低的基础学习率以稳定震荡
-      betas: [0.940, 0.999] 
+      base_lr: 0.0002           # 影响：初始学习率。配合损失归一化，0.0002能提供平稳的梯度下降
+      betas: [0.940, 0.999]     # 影响：AdamW优化器计算一阶/二阶动量的衰减率
     
     ema:
-      decay: 0.999 # 滤波滞留率
-      tau: 480 # 预热所需要的steps 训练一批数据就一个step
+      decay: 0.999              # 影响：指数移动平均的保留率。平滑训练过程中的震荡，记录更稳健的权重
+      tau: 480                  # 影响：EMA预热步数，前期更新快，后期严格遵守0.999的保留率
 
     scheduler:
-      T_0: 300                  # 【保持】取消重启机制，直接退火至结束
-      T_mult: 1
+      T_0: 200                  # 影响：Cosine退火的周期。设为总Epoch数表示不进行重启，学习率平滑下降到0
+      T_mult: 1                 # 影响：重启周期乘数（无重启时无效）
     
     post_process:
-      conf_threshold: 0.5 
-      kpt_dist_thresh: 15.0
+      conf_threshold: 0.5       # 影响：推理时过滤低置信度目标的阈值
+      kpt_dist_thresh: 15.0     # 影响：关键点NMS阈值。如果两个预测结果的关键点距离小于15像素，则认为是同一目标并抑制得分低的
 
     data:
-      class_id: [0, 2, 5, 6, 8, 11, 12]
+      class_id: [0, 2, 5, 6, 8, 11, 12] # 影响：当前训练实际参与的类别（提取子集）
       train_img_dir: "./data/datasets/images/train"
       train_label_dir: "./data/datasets/labels/train"
       val_img_dir: "./data/datasets/images/val"
       val_label_dir: "./data/datasets/labels/val"
-      num_workers: 16
-      scale_ranges: [[0, 140], [120, 250], [237, 640]]
+      num_workers: 16           # 影响：用于数据加载和CPU增强的进程数。拉高可打满CPU，防止GPU空载等待
+      # 【核心修正项】
+      scale_ranges: [[0, 23], [20, 90], [87, 416]] # 影响：决定多大尺寸的装甲板由哪一层网络预测。已完美适配416输入，三个检测头负载均衡
 
-    # --- 损失函数权重 ---
+    # ==========================================
+    # 损失函数配置
+    # ==========================================
     loss:
-      lambda_pose: 5.0
-      lambda_cls: 4.0   
-      alpha: 0.25
-      gamma: 2.0
-      omega: 10.0
-      epsilon: 2.0
+      # 【核心修正项】和为1，相当于在全局层面稳定了学习率，避免噪声梯度爆炸
+      lambda_pose: 0.67         # 影响：位姿回归(关键点)损失的全局权重 
+      lambda_cls: 0.33          # 影响：分类损失的全局权重
+      alpha: 0.25               # 影响：Focal Loss正负样本平衡系数，缓解赛场背景(负样本)压倒目标(正样本)的问题
+      gamma: 2.0                # 影响：Focal Loss难易样本挖掘系数，使网络聚焦于难以分类的目标
+      omega: 10.0               # 影响：Wing Loss(用于关键点)的线性和对数区域转折点
+      epsilon: 2.0              # 影响：Wing Loss的曲率控制参数
 
     pck:
-      target_in_range_dist: 10.0
-      max_pixel_threshold: 5.0 
+      target_in_range_dist: 10.0 # 影响：评估时，预测中心与真实中心距离小于此值才被认为是匹配的候选目标
+      max_pixel_threshold: 5.0   # 影响：PCK@5 评估标准。预测角点与真实角点误差小于5像素记为正确回归
     
-    # 综合评估得分权重配置
     metric_weights:
-      pck: 0.65        # PCK 占总分的权重
-      id_acc: 0.35     # 类别 ID 准确率占总分的权重
+      pck: 0.65                 # 影响：决定保存best_model时，PCK指标占总分的65%（视觉算法关键点更重要）
+      id_acc: 0.35              # 影响：决定类别准确率占总分的35%
 
     early_stopping:
-      enabled: true          # 【修改】：开启早停
-      patience: 60           # 【修改】：如果连续 60 个 Epoch 分数没破纪录，直接停止    
+      enabled: true          
+      patience: 60           
+      disable_aug_ratio: 0.2  # 划出 patience 的最后 20% 用于无增强冲刺
 
+# ==========================================
+# 导出配置：用于将PyTorch权重转换为部署格式
+# ==========================================
 kielas_rm_export:
   weights: "./model_res/best_model.pth"
   num_classes: 13                 
   negative_class_id: 12
   output_dir: "./export_res"
   formats: 
-    - "onnx"
-    - "torchscript"
+    - "onnx"                    # 影响：导出为ONNX格式，主要用于C++ TensorRT/OpenVINO部署
+    - "torchscript"             # 影响：导出为TorchScript，用于LibTorch部署
   input_size: [416, 416]
   
   onnx:
-    opset: 18
-    simplify: true
+    opset: 18                   # 影响：ONNX算子集版本。18兼容目前主流推理框架的较新版本
+    simplify: true              # 影响：调用onnx-simplifier消除冗余算子（如常数折叠），加快推理速度
 
+# ==========================================
+# 演示与实车推理测试配置
+# ==========================================
 kielas_rm_demo:
-  camera_type: "hik" 
-  camera_index: 0
-  hik_exposure: 5000
-  hik_gain: 10
-  model_type: "onnx" 
+  camera_type: "hik"            # 影响：指定相机后端类型，"hik"表示调用海康威视工业相机SDK
+  camera_index: 0               # 影响：设备索引号
+  hik_exposure: 5000            # 影响：相机曝光时间。较短(5000)可避免运动模糊，提取清晰灯条
+  hik_gain: 10                  # 影响：相机增益。在短曝光下提高画面亮度，但会引入底噪
+  model_type: "onnx"            # 影响：推理引擎类型
   model_path: "./export_res/best_model.onnx"
-  device: "cuda"
+  device: "cuda"                # 影响：推理使用的硬件
   num_classes: 13
   negative_class_id: 12                 
   input_size: [416, 416]
-  strides: [8, 16, 32]
-  conf_threshold: 0.7
-  kpt_dist_thresh: 15.0
+  strides: [8, 16, 32]          # 影响：解码网络输出特征图所需的步长信息
+  conf_threshold: 0.7           # 影响：实车测试时过滤低质量预测。高于训练时的0.5以保证赛场输出纯净度
+  kpt_dist_thresh: 15.0         # 影响：实车推理阶段的NMS过滤阈值
